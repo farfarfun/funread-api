@@ -1,6 +1,6 @@
 [project]
 name = "funread-api"
-version = "0.1.1"
+version = "0.1.2"
 description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,7 +32,6 @@ email = "niuliangtao@qq.com"
 [[project.authors]]
 name = "farfarfun"
 email = "farfarfun@qq.com"
-
 [[project.maintainers]]
 name = "牛哥"
 email = "niuliangtao@qq.com"
