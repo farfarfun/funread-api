@@ -7,10 +7,6 @@ from typing import Literal
 
 import requests
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import AnyHttpUrl, BaseModel
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
-
 from funread.legado.manage.source.storage import (
     SourceListRecord,
     count_source_items,
@@ -19,6 +15,9 @@ from funread.legado.manage.source.storage import (
     get_session_factory,
     utcnow,
 )
+from pydantic import AnyHttpUrl, BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/sources", tags=["sources"])
 SourceType = Literal["book", "rss"]

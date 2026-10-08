@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
-
 from funread.legado.manage.source.storage import init_source_db
+
 from funread_api.v1 import api_router
 
 
@@ -36,13 +36,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-
-
-def run() -> None:
-    import uvicorn
-
-    uvicorn.run("funread_api.app:app", host="0.0.0.0", port=18811)
-
-
-if __name__ == "__main__":
-    run()
