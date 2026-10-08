@@ -5,7 +5,9 @@ description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "funread>=1.1.101",
+    # [reader] pulls in lxml/cssselect/jsonpath-ng — the rule engine needs them,
+    # the collection pipeline does not.
+    "funread[reader]>=1.1.103",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
@@ -56,3 +58,9 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+# funread is the sibling workspace package, not a third-party dependency. Ruff
+# only sees it installed into site-packages and would otherwise split it away
+# from funread_api, which is how the import blocks are actually written.
+known-first-party = ["funread", "funread_api"]

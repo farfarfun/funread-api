@@ -191,3 +191,6 @@ hubs/rss/source
 .specstory/
 CLAUDE.local.md
 AGENTS.local.md
+
+# farlog writes here when the API runs (including under pytest)
+logs/
