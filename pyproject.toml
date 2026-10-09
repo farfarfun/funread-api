@@ -7,7 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     # [reader] pulls in lxml/cssselect/jsonpath-ng — the rule engine needs them,
     # the collection pipeline does not.
-    "funread[reader]>=1.1.103",
+    # 下界必须 >=1.1.104: `reader` extra 是 1.1.104 才有的。1.1.103 上
+    # `funread[reader]` 不报错, 只是解析成「没有额外依赖」—— lxml 静默缺席,
+    # 规则引擎在 import 时才炸。
+    "funread[reader]>=1.1.104",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
