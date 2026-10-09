@@ -68,6 +68,26 @@ class BookKeyOut(BaseModel):
 class SwitchSourceIn(BaseModel):
     url_id: int
     book_url: str
+    #: 要不要把阅读进度重新定位到新源的目录里。关掉可以省一次目录抓取，
+    #: 适用于「还没开始读就换源」。
+    remap_progress: bool = True
+
+
+class SwitchSourceOut(BaseModel):
+    """换源后进度落在哪一章。
+
+    `method` 决定界面该怎么说：
+      - `exact` / `normalized` —— 按章节名定位到了，可以直接接着读；
+      - `position` —— 按比例估的，**必然不准**，界面要提示用户确认；
+      - `none` —— 新源的目录取不到，进度没动，要用户手动选章；
+      - `skipped` —— 本来就没有进度可搬。
+    """
+
+    method: str
+    chapter_index: int
+    chapter_name: str
+    total: int
+    is_approximate: bool = False
 
 
 class DownloadIn(BaseModel):
@@ -148,17 +168,40 @@ def save_progress(
     )
 
 
-@router.post("/{book_key}/source", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.post("/{book_key}/source", response_model=SwitchSourceOut)
 def switch_source(
     book_key: str,
     payload: SwitchSourceIn,
     user: CurrentUser = Depends(require_user),
-) -> None:
-    """Point the book at another source. Drops the chapter cache on purpose:
-    chapter numbering differs between sites, so keeping it would mix chapters."""
+) -> SwitchSourceOut:
+    """Point the book at another source, and re-locate the reading progress.
+
+    Drops the chapter cache on purpose: chapter numbering differs between
+    sites, so keeping it would mix chapters.
+
+    **Re-locating the progress is a correctness matter, not a nicety.** Without
+    it the shelf still says "read up to chapter 500" while that index now
+    points at different content in the new source -- "continue reading" would
+    land somewhere unrelated with no way to tell something went wrong. The
+    response says *how* it was located so the UI can flag an approximate hit
+    instead of pretending it nailed it.
+
+    Returns 200 with that verdict rather than 204: the caller needs the index to
+    navigate to, and needs to know whether to trust it.
+    """
     _require_shelf_book(book_key, user)
-    get_reader_service().switch_source(
-        book_key, url_id=payload.url_id, book_url=payload.book_url, user_id=user.user_id
+    #  Not inside engine_errors(): the switch itself is a local DB write that
+    #  has already succeeded by the time the remap runs. A failed TOC fetch
+    #  comes back as method="none", not as a 502 that would wrongly suggest the
+    #  source was not switched at all.
+    return SwitchSourceOut(
+        **get_reader_service().switch_source(
+            book_key,
+            url_id=payload.url_id,
+            book_url=payload.book_url,
+            user_id=user.user_id,
+            remap_progress=payload.remap_progress,
+        )
     )
 
 

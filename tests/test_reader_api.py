@@ -369,5 +369,69 @@ def test_switching_source_drops_the_cache(client):
         json={"url_id": 2, "book_url": "https://b.example.com/b/9"},
     )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     assert get_cached_chapter(book_key, 1, database_url=client.service.database_url) is None
+
+
+def test_switching_without_progress_skips_the_remap(client):
+    """还没开始读，没有进度可搬 —— 不该为此去抓一次目录。"""
+    book_key = client.post("/api/v1/shelf", json={"name": "剑来", "url_id": 1}).json()["book_key"]
+
+    body = client.post(
+        f"/api/v1/shelf/{book_key}/source",
+        json={"url_id": 1, "book_url": "https://a.example.com/b/1"},
+    ).json()
+
+    assert body["method"] == "skipped"
+
+
+def test_switching_source_relocates_the_progress_by_chapter_name(client):
+    """换源后进度必须跟着走 —— 否则书架上的章节号指向新源里的别的内容。"""
+    book_key = client.post(
+        "/api/v1/shelf",
+        json={"name": "剑来", "url_id": 1, "book_url": "https://a.example.com/b/1"},
+    ).json()["book_key"]
+    #  这个假源的目录是「第一章」「第二章」，先把进度放在第二章
+    client.put(
+        f"/api/v1/shelf/{book_key}/progress",
+        json={"chapter_index": 1, "chapter_name": "第二章", "char_offset": 1234},
+    )
+
+    body = client.post(
+        f"/api/v1/shelf/{book_key}/source",
+        json={"url_id": 1, "book_url": "https://a.example.com/b/1"},
+    ).json()
+
+    assert body["method"] == "exact"
+    assert body["chapter_index"] == 1
+    assert body["chapter_name"] == "第二章"
+    assert body["is_approximate"] is False
+    #  字符偏移不能跨源沿用 —— 新源这一章的长度和分段都不一样
+    progress = client.get("/api/v1/shelf").json()[0]["progress"]
+    assert progress["chapter_index"] == 1
+    assert progress["char_offset"] == 0
+
+
+def test_a_failed_toc_fetch_reports_none_instead_of_failing_the_switch(client):
+    """源已经换了（本地写库）。一次抓取失败不该变成整个换源失败。"""
+    book_key = client.post(
+        "/api/v1/shelf",
+        json={"name": "剑来", "url_id": 1, "book_url": "https://a.example.com/b/1"},
+    ).json()["book_key"]
+    client.put(
+        f"/api/v1/shelf/{book_key}/progress",
+        json={"chapter_index": 1, "chapter_name": "第二章"},
+    )
+
+    response = client.post(
+        f"/api/v1/shelf/{book_key}/source",
+        #  StaticFetcher 里没有这个 URL，所以取目录必然失败
+        json={"url_id": 1, "book_url": "https://a.example.com/does-not-exist"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["method"] == "none"
+    #  进度原样保留，让用户自己选章
+    assert body["chapter_index"] == 1
+    assert client.get("/api/v1/shelf").json()[0]["url_id"] == 1
