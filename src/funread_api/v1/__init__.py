@@ -4,6 +4,7 @@ from funread_api.security import require_reader, require_session, require_user
 
 from .auth import router as auth_router
 from .reader import router as reader_router
+from .rss import router as rss_router
 from .shelf import router as shelf_router
 from .sources import router as sources_router
 
@@ -27,5 +28,10 @@ api_router.include_router(reader_router, dependencies=[Depends(require_reader)])
 #  CurrentUser value itself; FastAPI caches the dependency per request, so it
 #  resolves once.
 api_router.include_router(shelf_router, dependencies=[Depends(require_user)])
+
+#  /rss is per-user state too, and POST /rss/subscriptions makes the server
+#  fetch a URL the caller supplies (SSRF). Same guard as /shelf: authenticated
+#  reader only, never opened by FUNREAD_READER_PUBLIC.
+api_router.include_router(rss_router, dependencies=[Depends(require_user)])
 
 __all__ = ["api_router"]

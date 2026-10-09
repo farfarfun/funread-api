@@ -17,10 +17,11 @@ from funread.legado.engine import (
     UnsupportedFeatureError,
     WebViewNotSupportedError,
 )
-from funread.legado.reader import ReaderService
+from funread.legado.reader import ReaderService, RssService
 
 _lock = threading.Lock()
 _services: Dict[Tuple[Optional[str], Optional[str]], ReaderService] = {}
+_rss_services: Dict[Tuple[Optional[str], Optional[str]], RssService] = {}
 
 
 def get_reader_service() -> ReaderService:
@@ -45,10 +46,28 @@ def get_reader_service() -> ReaderService:
         return service
 
 
+def get_rss_service() -> RssService:
+    """Process-wide subscription service, keyed the same way as the reader one.
+
+    A separate instance rather than a field on ``ReaderService``: it owns an
+    RSS-typed ``SourceRegistry`` (different archive subdirectory, different
+    ``reader_source_prefs`` partition), and sharing one registry between book
+    and rss would hand book specs to the RSS engine.
+    """
+    key = (os.environ.get("FUNREAD_CACHE_ROOT"), os.environ.get("FUNREAD_DATABASE_URL"))
+    with _lock:
+        service = _rss_services.get(key)
+        if service is None:
+            service = RssService(cache_root=key[0], database_url=key[1])
+            _rss_services[key] = service
+        return service
+
+
 def reset_reader_services() -> None:
     """Drop the cached services. Only for tests and hot config reloads."""
     with _lock:
         _services.clear()
+        _rss_services.clear()
 
 
 @dataclass
@@ -198,5 +217,6 @@ __all__ = [
     "engine_errors",
     "get_download_tracker",
     "get_reader_service",
+    "get_rss_service",
     "reset_reader_services",
 ]

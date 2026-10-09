@@ -75,7 +75,35 @@ def _search_hit(client):
 def test_scan_reports_what_it_enabled(client):
     report = client.post("/api/v1/reader/scan").json()
 
-    assert report == {"scanned": 1, "complete": 1, "needs_js": 0, "enabled": 1}
+    assert report == {
+        "source_type": "book",
+        "scanned": 1,
+        "complete": 1,
+        "needs_js": 0,
+        "web_view": 0,
+        "enabled": 1,
+    }
+
+
+def test_the_two_source_types_have_separate_pools(client):
+    """rss 的候选池是另一次扫描，不是 book 那次的副作用。"""
+    book = client.post("/api/v1/reader/scan").json()
+    rss = client.post("/api/v1/reader/scan", params={"source_type": "rss"}).json()
+
+    assert book["enabled"] == 1
+    #  这个夹具的归档里只有 book 源，所以 rss 侧应当什么都没扫到
+    assert rss == {
+        "source_type": "rss",
+        "scanned": 0,
+        "complete": 0,
+        "needs_js": 0,
+        "web_view": 0,
+        "enabled": 0,
+    }
+
+
+def test_scan_rejects_an_unknown_source_type(client):
+    assert client.post("/api/v1/reader/scan", params={"source_type": "video"}).status_code == 422
 
 
 def test_search_returns_the_book_with_its_sources(client):

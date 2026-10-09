@@ -11,7 +11,7 @@ from funread.legado.engine import BookInfo, Chapter
 from funread.legado.reader import DEFAULT_SEARCH_SOURCES
 from funread_api.security import CurrentUser, require_user
 
-from .deps import engine_errors, get_reader_service
+from .deps import engine_errors, get_reader_service, get_rss_service
 
 router = APIRouter(prefix="/reader", tags=["reader"])
 
@@ -123,9 +123,12 @@ class ContentOut(BaseModel):
 
 
 class ScanReport(BaseModel):
+    source_type: str
     scanned: int
     complete: int
     needs_js: int
+    #: Sources that need a browser (`singleUrl`). Only non-zero for rss.
+    web_view: int
     enabled: int
 
 
@@ -216,14 +219,24 @@ def sources_for(
 
 
 @router.post("/scan", response_model=ScanReport, status_code=status.HTTP_200_OK)
-def scan(limit: int | None = Query(default=None, ge=1)) -> ScanReport:
+def scan(
+    source_type: str = Query(default="book", pattern="^(book|rss)$"),
+    limit: int | None = Query(default=None, ge=1),
+) -> ScanReport:
     """Rebuild the candidate pool from the local source archive.
 
-    Required before the first search -- until this runs, ``reader_source_prefs``
-    is empty and every search returns nothing. Synchronous and slow (tens of
-    thousands of small files); ``limit`` exists so a smoke run stays quick.
+    Required before the first search or subscription-directory browse -- until
+    this runs, ``reader_source_prefs`` is empty and both return nothing. The
+    two source types have separate pools, so ``source_type=rss`` is a separate
+    run, not a side effect of the book one.
+
+    Synchronous and slow (tens of thousands of small files); ``limit`` exists so
+    a smoke run stays quick.
 
     Safe to re-run: it only refreshes the static verdicts and leaves the
     live-result columns (``fail_count``/``last_ok_at``) alone.
     """
-    return ScanReport(**get_reader_service().registry.scan(limit=limit))
+    registry = (
+        get_rss_service().registry if source_type == "rss" else get_reader_service().registry
+    )
+    return ScanReport(source_type=source_type, **registry.scan(limit=limit))
