@@ -435,3 +435,41 @@ def test_a_failed_toc_fetch_reports_none_instead_of_failing_the_switch(client):
     #  进度原样保留，让用户自己选章
     assert body["chapter_index"] == 1
     assert client.get("/api/v1/shelf").json()[0]["url_id"] == 1
+
+
+def test_switch_candidates_include_near_matches_and_stats(client):
+    """按 book_key 精确筛会静默丢掉作者名写法不同的源 —— 那些往往恰恰还活着。"""
+    book_key = client.post(
+        "/api/v1/shelf",
+        json={"name": "剑来", "author": "烽火戏诸侯", "url_id": 1, "book_url": "https://a.example.com/b/1"},
+    ).json()["book_key"]
+
+    body = client.get("/api/v1/reader/sources", params={"book_key": book_key}).json()
+
+    assert body["book_key"] == book_key
+    assert body["name"] == "剑来"
+    #  统计字段在，界面才能解释「为什么换源列表是空的」
+    for field in ("sources_tried", "sources_ok", "hits", "exhausted", "stopped_by"):
+        assert field in body
+    #  这个夹具只有一个源，它就是当前源
+    assert [item["url_id"] for item in body["items"]] == [1]
+    assert body["items"][0]["current"] is True
+    assert body["items"][0]["exact"] is True
+    assert body["items"][0]["author"] == "烽火戏诸侯"
+
+
+def test_switch_candidates_for_a_book_not_on_the_shelf_is_a_404(client):
+    assert client.get(
+        "/api/v1/reader/sources", params={"book_key": "不存在"}
+    ).status_code == 404
+
+
+def test_search_reports_how_it_stopped(client):
+    """exhausted 为真才说明「没搜到」是确定结论，而不是还没搜那么深。"""
+    body = client.get("/api/v1/reader/search", params={"keyword": "查无此书"}).json()
+
+    assert body["exhausted"] is True
+    assert body["stopped_by"] == "exhausted"
+    assert body["waves"] == 1
+    assert body["hits"] == 0
+    assert body["elapsed"] >= 0

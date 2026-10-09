@@ -16,10 +16,59 @@ from .deps import engine_errors, get_reader_service, get_rss_service
 router = APIRouter(prefix="/reader", tags=["reader"])
 
 
+class SearchStats(BaseModel):
+    """How the fan-out went this round.
+
+    Without these the UI cannot tell "nothing matched" from "the sources we
+    tried were all dead", and both look like a bug to the person holding the
+    phone. The pool has 5,606 usable book sources and only single-digit
+    percentages actually work, so "tried 24, two answered" is the normal case
+    and the UI has to be able to say that out loud.
+    """
+
+    sources_tried: int
+    sources_ok: int
+    #: Sources that returned at least one result. The search stops once there
+    #: are enough of these.
+    hits: int
+    #: Sources skipped because their rules need a JS runtime. Structural --
+    #: a different keyword will not help, so the UI should say so.
+    js_skipped: int
+    failed: int
+    #: How many waves of concurrent requests it took.
+    waves: int
+    elapsed: float
+    #: True when the candidate pool really ran out. Only then is "not found" a
+    #: settled conclusion rather than "we have not looked that deep yet".
+    exhausted: bool
+    #: `enough` | `budget` | `max_sources` | `exhausted` | `empty`
+    stopped_by: str
+
+
 class SourceRef(BaseModel):
     url_id: int
     source_name: str
     book_url: str
+
+
+class SwitchCandidate(SourceRef):
+    """换源列表里的一项：一个源 + 这本书在该源下的样子。"""
+
+    name: str
+    author: str
+    last_chapter: str
+    #: True when 书名与作者都对得上（`book_key` 完全一致）。为 False 的那些**不该
+    #: 被藏起来** —— 作者名写法差异很常见，而那些源往往恰恰是还活着的。
+    exact: bool
+    #: 当前正在读的那个源。
+    current: bool
+
+
+class SwitchSourcePage(SearchStats):
+    items: list[SwitchCandidate]
+    total: int
+    book_key: str
+    name: str
 
 
 class SearchBookOut(BaseModel):
@@ -34,20 +83,11 @@ class SearchBookOut(BaseModel):
     sources: list[SourceRef]
 
 
-class SearchPage(BaseModel):
+class SearchPage(SearchStats):
     items: list[SearchBookOut]
     total: int
     limit: int
     offset: int
-    #: How the fan-out went this round. Without these the UI cannot tell
-    #: "nothing matched" from "nine of ten sources need JS", and both look
-    #: like a bug to the person holding the phone.
-    sources_tried: int
-    sources_ok: int
-    #: Sources skipped because their rules need a JS runtime. Structural --
-    #: a different keyword will not help, so the UI should say so.
-    js_skipped: int
-    failed: int
 
 
 class BookInfoModel(BaseModel):
@@ -135,7 +175,10 @@ class ScanReport(BaseModel):
 @router.get("/search", response_model=SearchPage)
 def search(
     keyword: str = Query(min_length=1, max_length=64),
-    max_sources: int = Query(default=DEFAULT_SEARCH_SOURCES, ge=1, le=40),
+    #  上限对齐服务层的默认值。不要往下收：书源池有 5,606 个可用源，而实跑
+    #  可用率只有个位数百分比 —— 卡在几十个源上就是「这本书搜不到」。
+    #  真正护住响应时间的是服务层的墙钟预算，不是这个数。
+    max_sources: int = Query(default=DEFAULT_SEARCH_SOURCES, ge=1, le=2000),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> SearchPage:
@@ -155,10 +198,7 @@ def search(
         total=report["total"],
         limit=limit,
         offset=offset,
-        sources_tried=report["sources_tried"],
-        sources_ok=report["sources_ok"],
-        js_skipped=report["js_skipped"],
-        failed=report["failed"],
+        **{field: report[field] for field in SearchStats.model_fields},
     )
 
 
@@ -202,20 +242,41 @@ def content(payload: ContentRequest) -> ContentOut:
     )
 
 
-@router.get("/sources", response_model=list[SourceRef])
+@router.get("/sources", response_model=SwitchSourcePage)
 def sources_for(
     book_key: str = Query(min_length=1),
     user: CurrentUser = Depends(require_user),
-) -> list[SourceRef]:
+) -> SwitchSourcePage:
     """换源 list: which other sources carry this shelf book.
+
+    This runs a **live aggregated search** by title -- the shelf only records
+    the source currently being read, so the real list of alternatives cannot
+    come from the database.
+
+    Matching is by **title, loosely**, not by exact ``book_key``. ``book_key``
+    is ``md5(title\nauthor)``, so any difference in how a source spells the
+    author -- blank, traditional characters, a trailing "（著）" -- produces a
+    different key and the source would be dropped silently. Those are exactly
+    the sources a reader needs when the current one dies. ``exact`` flags the
+    ones where title *and* author agree; the UI may sort those first but must
+    not hide the rest.
+
+    Carries the search stats for the same reason ``/search`` does: the UI has
+    to be able to distinguish "there really is no other source" from "the
+    sources we tried this round were all dead".
 
     Reads the caller's shelf to recover the title, so it needs an identity even
     though the search itself is stateless.
     """
-    return [
-        SourceRef(**item)
-        for item in get_reader_service().sources_for(book_key, user_id=user.user_id)
-    ]
+    with engine_errors():
+        report = get_reader_service().sources_for(book_key, user_id=user.user_id)
+    return SwitchSourcePage(
+        items=[SwitchCandidate(**item) for item in report["items"]],
+        total=report["total"],
+        book_key=report["book_key"],
+        name=report["name"],
+        **{field: report[field] for field in SearchStats.model_fields},
+    )
 
 
 @router.post("/scan", response_model=ScanReport, status_code=status.HTTP_200_OK)
