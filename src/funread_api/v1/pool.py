@@ -154,7 +154,8 @@ def patch_pool_source(
     """
     if source_type not in ("book", "rss"):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="source_type 只能是 book 或 rss"
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="source_type 只能是 book 或 rss",
         )
 
     session_factory = get_session_factory(_database_url(source_type))

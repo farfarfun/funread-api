@@ -127,11 +127,7 @@ def register(payload: RegisterRequest, request: Request, response: Response) -> 
         user = create_user(payload.username, payload.password)
     except ValueError as error:
         #  Username taken is a conflict; everything else is the caller's input.
-        code = (
-            status.HTTP_409_CONFLICT
-            if "已被占用" in str(error)
-            else status.HTTP_400_BAD_REQUEST
-        )
+        code = status.HTTP_409_CONFLICT if "已被占用" in str(error) else status.HTTP_400_BAD_REQUEST
         raise HTTPException(status_code=code, detail=str(error)) from error
 
     _set_user_cookie(response, user.user_id, user.password_hash)
@@ -152,9 +148,7 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Sessio
     """Log in as a reader. One 401 for every failure -- see ``authenticate``."""
     user = authenticate(payload.username, payload.password)
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或口令不正确"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或口令不正确")
     _set_user_cookie(response, user.user_id, user.password_hash)
     return SessionState(
         auth_required=auth_enabled(),

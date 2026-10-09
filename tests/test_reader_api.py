@@ -443,7 +443,12 @@ def test_switch_candidates_include_near_matches_and_stats(client):
     """按 book_key 精确筛会静默丢掉作者名写法不同的源 —— 那些往往恰恰还活着。"""
     book_key = client.post(
         "/api/v1/shelf",
-        json={"name": "剑来", "author": "烽火戏诸侯", "url_id": 1, "book_url": "https://a.example.com/b/1"},
+        json={
+            "name": "剑来",
+            "author": "烽火戏诸侯",
+            "url_id": 1,
+            "book_url": "https://a.example.com/b/1",
+        },
     ).json()["book_key"]
 
     body = client.get("/api/v1/reader/sources", params={"book_key": book_key}).json()
@@ -461,9 +466,7 @@ def test_switch_candidates_include_near_matches_and_stats(client):
 
 
 def test_switch_candidates_for_a_book_not_on_the_shelf_is_a_404(client):
-    assert client.get(
-        "/api/v1/reader/sources", params={"book_key": "不存在"}
-    ).status_code == 404
+    assert client.get("/api/v1/reader/sources", params={"book_key": "不存在"}).status_code == 404
 
 
 def test_search_reports_how_it_stopped(client):
@@ -545,9 +548,7 @@ def test_explore_kinds_returns_opaque_tokens(explore_client):
 
 
 def test_explore_kinds_on_a_source_without_them_is_a_404(client):
-    assert client.get(
-        "/api/v1/reader/explore/kinds", params={"url_id": 1}
-    ).status_code == 404
+    assert client.get("/api/v1/reader/explore/kinds", params={"url_id": 1}).status_code == 404
 
 
 def test_explore_browses_a_category(explore_client):
@@ -565,9 +566,7 @@ def test_explore_browses_a_category(explore_client):
 
 
 def test_explore_on_a_dead_category_is_a_502(explore_client):
-    response = explore_client.get(
-        "/api/v1/reader/explore", params={"url_id": 7, "url": "/list/2"}
-    )
+    response = explore_client.get("/api/v1/reader/explore", params={"url_id": 7, "url": "/list/2"})
     assert response.status_code == 502
 
 

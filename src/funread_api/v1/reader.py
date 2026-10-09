@@ -358,9 +358,7 @@ def explore(
     """
     with engine_errors():
         items = get_reader_service().explore(url_id, url, page=page)
-    return ExplorePage(
-        items=[SearchBookOut(**item) for item in items], total=len(items), page=page
-    )
+    return ExplorePage(items=[SearchBookOut(**item) for item in items], total=len(items), page=page)
 
 
 @router.post("/scan", response_model=ScanReport, status_code=status.HTTP_200_OK)
@@ -381,7 +379,5 @@ def scan(
     Safe to re-run: it only refreshes the static verdicts and leaves the
     live-result columns (``fail_count``/``last_ok_at``) alone.
     """
-    registry = (
-        get_rss_service().registry if source_type == "rss" else get_reader_service().registry
-    )
+    registry = get_rss_service().registry if source_type == "rss" else get_reader_service().registry
     return ScanReport(source_type=source_type, **registry.scan(limit=limit))

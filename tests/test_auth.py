@@ -370,7 +370,10 @@ def test_shelves_do_not_leak_between_accounts(env):
         _register(bob, username="bob")
         assert bob.get("/api/v1/shelf").json() == []
         #  Knowing the key is not access
-        assert bob.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 1}).status_code == 404
+        assert (
+            bob.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 1}).status_code
+            == 404
+        )
         assert bob.delete(f"/api/v1/shelf/{book_key}").status_code == 404
         assert bob.get(f"/api/v1/shelf/{book_key}/cached").status_code == 404
 

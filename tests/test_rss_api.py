@@ -83,9 +83,7 @@ def client(monkeypatch, tmp_path):
 
 
 def _subscribe_feed(client, url=FEED_URL, **extra):
-    return client.post(
-        "/api/v1/rss/subscriptions", json={"kind": "feed", "feed_url": url, **extra}
-    )
+    return client.post("/api/v1/rss/subscriptions", json={"kind": "feed", "feed_url": url, **extra})
 
 
 def _subscribe_legado(client, url_id=1, **extra):
@@ -180,15 +178,15 @@ def test_a_web_view_source_cannot_be_subscribed(client):
 
 
 def test_subscribe_validates_the_kind_specific_field(client):
-    assert client.post(
-        "/api/v1/rss/subscriptions", json={"kind": "legado"}
-    ).status_code == 422
-    assert client.post(
-        "/api/v1/rss/subscriptions", json={"kind": "feed", "feed_url": " "}
-    ).status_code == 422
-    assert client.post(
-        "/api/v1/rss/subscriptions", json={"kind": "video", "url_id": 1}
-    ).status_code == 422
+    assert client.post("/api/v1/rss/subscriptions", json={"kind": "legado"}).status_code == 422
+    assert (
+        client.post("/api/v1/rss/subscriptions", json={"kind": "feed", "feed_url": " "}).status_code
+        == 422
+    )
+    assert (
+        client.post("/api/v1/rss/subscriptions", json={"kind": "video", "url_id": 1}).status_code
+        == 422
+    )
 
 
 def test_unsubscribe(client):
@@ -207,9 +205,9 @@ def test_unsubscribing_something_that_is_not_there_is_a_404(client):
 
 def test_categories_of_a_legado_subscription(client):
     sub_id = _subscribe_legado(client).json()["sub_id"]
-    names = [item["name"] for item in client.get(
-        f"/api/v1/rss/subscriptions/{sub_id}/categories"
-    ).json()]
+    names = [
+        item["name"] for item in client.get(f"/api/v1/rss/subscriptions/{sub_id}/categories").json()
+    ]
     assert names == ["头条", "科技"]
 
 
@@ -361,17 +359,13 @@ def test_read_all(client):
 
 def test_read_all_needs_at_least_one_key(client):
     sub_id = _subscribe_feed(client).json()["sub_id"]
-    response = client.put(
-        f"/api/v1/rss/subscriptions/{sub_id}/read-all", json={"article_keys": []}
-    )
+    response = client.put(f"/api/v1/rss/subscriptions/{sub_id}/read-all", json={"article_keys": []})
     assert response.status_code == 422
 
 
 def test_state_writes_are_scoped_to_the_subscription(client):
     """不能拿别人的 sub_id 去写状态。"""
-    response = client.put(
-        "/api/v1/rss/subscriptions/nope/articles/abc/read", json={"read": True}
-    )
+    response = client.put("/api/v1/rss/subscriptions/nope/articles/abc/read", json={"read": True})
     assert response.status_code == 404
 
 
@@ -451,7 +445,7 @@ def test_article_without_variables_passes_an_empty_dict(client, monkeypatch):
     monkeypatch.setattr(
         service,
         "article",
-        lambda *a, **kw: (seen.update(kw) or original(*a, **kw)),
+        lambda *a, **kw: seen.update(kw) or original(*a, **kw),
     )
     sub_id = _subscribe_feed(client).json()["sub_id"]
 

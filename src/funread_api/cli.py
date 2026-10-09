@@ -125,8 +125,7 @@ def _read_config(path: Path, *, explicit: bool) -> dict[str, object]:
             raw = _parse_env_file(text)
         else:
             raise RuntimeError(
-                f"unsupported config extension {suffix or '(none)'}: "
-                "expected .toml, .json or .env"
+                f"unsupported config extension {suffix or '(none)'}: expected .toml, .json or .env"
             )
     except (tomllib.TOMLDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"cannot parse config file {path}: {error}") from None
@@ -404,9 +403,7 @@ def _add_config_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog=CLI_NAME, description="Manage the funread API service"
-    )
+    parser = argparse.ArgumentParser(prog=CLI_NAME, description="Manage the funread API service")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     server = subcommands.add_parser("server", help="manage the API service")

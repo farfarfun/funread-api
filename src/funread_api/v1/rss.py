@@ -224,9 +224,7 @@ def list_subscriptions(user: CurrentUser = Depends(require_user)) -> list[Subscr
     return [SubscriptionOut(**item) for item in get_rss_service().subscriptions(user.user_id)]
 
 
-@router.post(
-    "/subscriptions", response_model=SubscriptionOut, status_code=status.HTTP_201_CREATED
-)
+@router.post("/subscriptions", response_model=SubscriptionOut, status_code=status.HTTP_201_CREATED)
 def subscribe(
     payload: SubscribeIn,
     user: CurrentUser = Depends(require_user),
@@ -254,13 +252,9 @@ def subscribe(
         #  A bad feed URL is the caller's typo, not a server fault, so the
         #  parse error comes back as 400 with the reason rather than a 502.
         try:
-            result = service.subscribe_feed(
-                payload.feed_url, user.user_id, title=payload.title
-            )
+            result = service.subscribe_feed(payload.feed_url, user.user_id, title=payload.title)
         except LookupError as error:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
-            ) from error
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -373,9 +367,7 @@ def read_article(
     parsed = _parse_variables(variables)
     with engine_errors():
         return ArticleDetail(
-            **get_rss_service().article(
-                sub_id, user.user_id, link, variables=parsed, title=title
-            )
+            **get_rss_service().article(sub_id, user.user_id, link, variables=parsed, title=title)
         )
 
 
@@ -393,9 +385,7 @@ def mark_read(
     service = get_rss_service()
     with engine_errors():
         service.subscription(sub_id, user.user_id)
-    service.mark_read(
-        sub_id, user.user_id, article_key, read=payload.read, meta=_meta(payload)
-    )
+    service.mark_read(sub_id, user.user_id, article_key, read=payload.read, meta=_meta(payload))
 
 
 @router.put(
