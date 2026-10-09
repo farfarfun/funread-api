@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from funread.legado.reader import (
@@ -10,6 +10,7 @@ from funread.legado.reader import (
     get_shelf_book,
     list_cached_chapter_indexes,
 )
+from funread_api.security import CurrentUser, require_user
 
 from .deps import get_reader_service
 from .reader import ChapterModel
@@ -87,42 +88,64 @@ class CacheState(BaseModel):
     chapter_indexes: list[int]
 
 
-def _require_shelf_book(book_key: str) -> None:
+def _require_shelf_book(book_key: str, user: CurrentUser) -> None:
+    """404 rather than 403 when the book belongs to someone else.
+
+    The lookup is already scoped by ``user_id``, so another user's book is
+    simply not there -- and saying "forbidden" would confirm it exists.
+    """
     service = get_reader_service()
-    if get_shelf_book(book_key, database_url=service.database_url) is None:
+    if get_shelf_book(book_key, user_id=user.user_id, database_url=service.database_url) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="书架里没有这本书")
 
 
 @router.get("", response_model=list[ShelfBookOut])
-def list_books() -> list[ShelfBookOut]:
-    return [ShelfBookOut(**item) for item in get_reader_service().shelf()]
+def list_books(user: CurrentUser = Depends(require_user)) -> list[ShelfBookOut]:
+    return [ShelfBookOut(**item) for item in get_reader_service().shelf(user_id=user.user_id)]
 
 
 @router.post("", response_model=BookKeyOut, status_code=status.HTTP_201_CREATED)
-def add_book(payload: ShelfBookIn) -> BookKeyOut:
+def add_book(
+    payload: ShelfBookIn,
+    user: CurrentUser = Depends(require_user),
+) -> BookKeyOut:
     """Idempotent: the key is derived from 书名+作者, so re-adding updates."""
-    book_key = get_reader_service().add_to_shelf(payload.model_dump(exclude_none=True))
+    book_key = get_reader_service().add_to_shelf(
+        payload.model_dump(exclude_none=True), user_id=user.user_id
+    )
     return BookKeyOut(book_key=book_key)
 
 
 @router.delete("/{book_key}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
-def remove_book(book_key: str) -> None:
-    if not get_reader_service().remove_from_shelf(book_key):
+def remove_book(book_key: str, user: CurrentUser = Depends(require_user)) -> None:
+    if not get_reader_service().remove_from_shelf(book_key, user_id=user.user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="书架里没有这本书")
 
 
 @router.put("/{book_key}/progress", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
-def save_progress(book_key: str, payload: ProgressIn) -> None:
-    _require_shelf_book(book_key)
-    get_reader_service().save_progress(book_key=book_key, **payload.model_dump())
+def save_progress(
+    book_key: str,
+    payload: ProgressIn,
+    user: CurrentUser = Depends(require_user),
+) -> None:
+    _require_shelf_book(book_key, user)
+    get_reader_service().save_progress(
+        book_key=book_key, user_id=user.user_id, **payload.model_dump()
+    )
 
 
 @router.post("/{book_key}/source", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
-def switch_source(book_key: str, payload: SwitchSourceIn) -> None:
+def switch_source(
+    book_key: str,
+    payload: SwitchSourceIn,
+    user: CurrentUser = Depends(require_user),
+) -> None:
     """Point the book at another source. Drops the chapter cache on purpose:
     chapter numbering differs between sites, so keeping it would mix chapters."""
-    _require_shelf_book(book_key)
-    get_reader_service().switch_source(book_key, url_id=payload.url_id, book_url=payload.book_url)
+    _require_shelf_book(book_key, user)
+    get_reader_service().switch_source(
+        book_key, url_id=payload.url_id, book_url=payload.book_url, user_id=user.user_id
+    )
 
 
 @router.post(
@@ -130,7 +153,12 @@ def switch_source(book_key: str, payload: SwitchSourceIn) -> None:
     response_model=DownloadAccepted,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def download(book_key: str, payload: DownloadIn, tasks: BackgroundTasks) -> DownloadAccepted:
+def download(
+    book_key: str,
+    payload: DownloadIn,
+    tasks: BackgroundTasks,
+    user: CurrentUser = Depends(require_user),
+) -> DownloadAccepted:
     """Pre-fetch chapters into the offline cache, in the background.
 
     202 rather than a result: a serial throttled fetch of a few hundred
@@ -138,7 +166,7 @@ def download(book_key: str, payload: DownloadIn, tasks: BackgroundTasks) -> Down
     for progress -- already-cached chapters are skipped, so a client that
     retries after a failure resumes instead of refetching.
     """
-    _require_shelf_book(book_key)
+    _require_shelf_book(book_key, user)
     if not payload.chapters:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有要下载的章节"
@@ -162,7 +190,14 @@ def download(book_key: str, payload: DownloadIn, tasks: BackgroundTasks) -> Down
 
 
 @router.get("/{book_key}/cached", response_model=CacheState)
-def cached_chapters(book_key: str) -> CacheState:
+def cached_chapters(book_key: str, user: CurrentUser = Depends(require_user)) -> CacheState:
+    """Which chapters are already on disk.
+
+    Gated on the caller having the book on *their* shelf even though the cache
+    itself is shared -- otherwise this would answer "which chapters has anyone
+    downloaded" for an arbitrary book_key.
+    """
+    _require_shelf_book(book_key, user)
     service = get_reader_service()
     return CacheState(
         book_key=book_key,
@@ -171,7 +206,10 @@ def cached_chapters(book_key: str) -> CacheState:
 
 
 @router.delete("/{book_key}/cached", response_model=CacheState)
-def clear_cache(book_key: str) -> CacheState:
+def clear_cache(book_key: str, user: CurrentUser = Depends(require_user)) -> CacheState:
+    """Drop the cached text. Shared, so this affects every reader of the book --
+    acceptable because it only costs a refetch, and a stuck bad cache is worse."""
+    _require_shelf_book(book_key, user)
     service = get_reader_service()
     clear_chapter_cache(book_key, database_url=service.database_url)
     return CacheState(book_key=book_key, chapter_indexes=[])

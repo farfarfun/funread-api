@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 
 from funread.legado.engine import BookInfo, Chapter
 from funread.legado.reader import DEFAULT_SEARCH_SOURCES
+from funread_api.security import CurrentUser, require_user
 
 from .deps import engine_errors, get_reader_service
 
@@ -173,9 +174,19 @@ def content(payload: ContentRequest) -> ContentOut:
 
 
 @router.get("/sources", response_model=list[SourceRef])
-def sources_for(book_key: str = Query(min_length=1)) -> list[SourceRef]:
-    """换源 list: which other sources carry this shelf book."""
-    return [SourceRef(**item) for item in get_reader_service().sources_for(book_key)]
+def sources_for(
+    book_key: str = Query(min_length=1),
+    user: CurrentUser = Depends(require_user),
+) -> list[SourceRef]:
+    """换源 list: which other sources carry this shelf book.
+
+    Reads the caller's shelf to recover the title, so it needs an identity even
+    though the search itself is stateless.
+    """
+    return [
+        SourceRef(**item)
+        for item in get_reader_service().sources_for(book_key, user_id=user.user_id)
+    ]
 
 
 @router.post("/scan", response_model=ScanReport, status_code=status.HTTP_200_OK)

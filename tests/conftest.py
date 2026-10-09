@@ -1,6 +1,8 @@
 import pytest
 
+from funread.legado.reader import storage
 from funread_api import security
+from funread_api.v1.deps import reset_reader_services
 
 
 @pytest.fixture(autouse=True)
@@ -16,3 +18,26 @@ def _no_ambient_secrets(monkeypatch):
     monkeypatch.setattr(security, "_read_secret", lambda: None)
     monkeypatch.delenv("FUNREAD_API_PASSWORD", raising=False)
     monkeypatch.delenv("FUNREAD_READER_PUBLIC", raising=False)
+    #  Registration is closed by default; a developer's shell must not open it.
+    monkeypatch.delenv("FUNREAD_REGISTER_CODE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_database(tmp_path, monkeypatch):
+    """Point every test at its own SQLite file and cache root.
+
+    Belt and braces over funread's own autouse fixture: this process resolves
+    the database through ``funread.base.config``, which falls back to funsecret
+    -- and on this machine that is the production MySQL. A test that forgets to
+    set the env var must not reach it.
+
+    ``_INITIALIZED_DATABASES`` and the memoised services are keyed by URL, so
+    both are cleared: otherwise the first test's engine (and its schema
+    migration state) would be reused by every later one.
+    """
+    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'funread-test.db'}")
+    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(tmp_path / "hubs"))
+    monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
+    reset_reader_services()
+    yield
+    reset_reader_services()
