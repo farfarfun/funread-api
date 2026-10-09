@@ -45,6 +45,13 @@ email = "farfarfun@qq.com"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.funbuild]
+# 发版时把 funread 的版本下界抬到最新 —— pip 默认 only-if-needed，下界不动的话
+# 已装的旧 funread 不会被升上来，而这个服务的规则引擎就跟着旧。
+# 用 latest-packages 而不是 funbuild.toml 的 packages：后者走 uv remove + uv add，
+# 会把上面那个 [reader] extra 丢掉。
+latest-packages = ["funread"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/funread_api"]
 
