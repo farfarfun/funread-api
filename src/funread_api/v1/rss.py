@@ -16,6 +16,8 @@ a legitimate thing to want, and blocking it would break real use.
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
@@ -149,6 +151,30 @@ class FavoriteOut(BaseModel):
     pub_date: str
     image: str
     read: bool
+
+
+def _parse_variables(raw: str) -> dict[str, str]:
+    """Decode the JSON-encoded ``variables`` query parameter.
+
+    Malformed input is the caller's bug, so it is a 422 rather than a silent
+    empty dict -- silently dropping variables is exactly the failure this
+    parameter exists to prevent.
+    """
+    if not raw.strip():
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"variables 不是合法的 JSON：{error}",
+        ) from error
+    if not isinstance(decoded, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="variables 必须是一个 JSON 对象",
+        )
+    return {str(key): str(value) for key, value in decoded.items()}
 
 
 def _meta(payload: ReadIn | FavoriteIn) -> dict[str, str]:
@@ -320,17 +346,36 @@ def read_article(
     sub_id: str = Query(min_length=1),
     link: str = Query(min_length=1, max_length=2048),
     title: str = Query(default="", max_length=512),
+    variables: str = Query(
+        default="",
+        max_length=4096,
+        description=(
+            "列表响应里那一项的 variables，JSON 对象。规则可以在列表页 @put、"
+            "在正文页 @get —— 不回传这些源会静默读到空正文。"
+        ),
+    ),
     user: CurrentUser = Depends(require_user),
 ) -> ArticleDetail:
     """One article's text.
 
     GET with the link in the query string rather than POST with a body: it is
     a read, and being linkable matters -- the front-end router puts the link in
-    the URL so a reload lands back on the same article.
+    the URL so a reload lands back on the same article. ``variables`` therefore
+    rides along JSON-encoded rather than as a request body.
+
+    Round-tripping ``variables`` matters for the same reason it does on the book
+    side: rules capture values with ``@put`` on the list page and read them back
+    with ``@get`` on the article page. Only 2 archived sources do this today and
+    neither is currently runnable (both need JS), but the engine already emits
+    the values -- dropping them here would mean those sources break silently the
+    day a JS runtime lands.
     """
+    parsed = _parse_variables(variables)
     with engine_errors():
         return ArticleDetail(
-            **get_rss_service().article(sub_id, user.user_id, link, title=title)
+            **get_rss_service().article(
+                sub_id, user.user_id, link, variables=parsed, title=title
+            )
         )
 
 

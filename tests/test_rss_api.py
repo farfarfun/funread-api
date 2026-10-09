@@ -413,3 +413,74 @@ def test_reader_public_does_not_open_the_ssrf_endpoint(client, monkeypatch):
 
     assert _subscribe_feed(client).status_code == 401
     assert client.get("/api/v1/rss/sources").status_code == 401
+
+
+# ---------------------------------------------------------------- variables 回传
+
+
+def test_article_variables_round_trip(client, monkeypatch):
+    """列表页 @put、正文页 @get 的源要靠这个。丢掉就静默读到空正文。"""
+    seen: dict = {}
+    service = get_rss_service()
+    original = service.article
+
+    def spy(sub_id, user_id, link, variables=None, title=""):
+        seen["variables"] = variables
+        return original(sub_id, user_id, link, variables=variables, title=title)
+
+    monkeypatch.setattr(service, "article", spy)
+    sub_id = _subscribe_feed(client).json()["sub_id"]
+
+    response = client.get(
+        "/api/v1/rss/article",
+        params={
+            "sub_id": sub_id,
+            "link": "https://blog.example.com/1",
+            "variables": '{"token":"abc","page":"2"}',
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["variables"] == {"token": "abc", "page": "2"}
+
+
+def test_article_without_variables_passes_an_empty_dict(client, monkeypatch):
+    seen: dict = {}
+    service = get_rss_service()
+    original = service.article
+    monkeypatch.setattr(
+        service,
+        "article",
+        lambda *a, **kw: (seen.update(kw) or original(*a, **kw)),
+    )
+    sub_id = _subscribe_feed(client).json()["sub_id"]
+
+    client.get(
+        "/api/v1/rss/article",
+        params={"sub_id": sub_id, "link": "https://blog.example.com/1"},
+    )
+
+    assert seen["variables"] == {}
+
+
+@pytest.mark.parametrize("raw", ["{not json", "[1,2]", '"a string"', "42"])
+def test_malformed_variables_is_a_422_not_a_silent_drop(client, raw):
+    """静默丢掉 variables 正是这个参数要防的那种失败。"""
+    sub_id = _subscribe_feed(client).json()["sub_id"]
+
+    response = client.get(
+        "/api/v1/rss/article",
+        params={"sub_id": sub_id, "link": "https://blog.example.com/1", "variables": raw},
+    )
+
+    assert response.status_code == 422
+    assert "variables" in response.json()["detail"]
+
+
+def test_list_response_carries_variables(client):
+    """列表给出 variables，正文页才有东西可回传 —— 两头必须都在。"""
+    sub_id = _subscribe_feed(client).json()["sub_id"]
+    page = client.get("/api/v1/rss/articles", params={"sub_id": sub_id}).json()
+
+    assert "variables" in page["items"][0]
+    assert isinstance(page["items"][0]["variables"], dict)
