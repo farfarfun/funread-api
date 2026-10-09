@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 from funread_api.security import require_reader, require_session, require_user
 
 from .auth import router as auth_router
+from .pool import router as pool_router
 from .reader import router as reader_router
 from .rss import router as rss_router
 from .shelf import router as shelf_router
@@ -18,6 +19,10 @@ api_router.include_router(auth_router)
 #  it must never be reachable via the FUNREAD_READER_PUBLIC escape hatch, and
 #  never via a mere reader account either -- reading is not administering.
 api_router.include_router(sources_router, dependencies=[Depends(require_session)])
+
+#  /pool 查看与干预候选源池。管理端动作：改一个源的启停会影响**所有用户**的
+#  搜索结果，不该由任意读者改。
+api_router.include_router(pool_router, dependencies=[Depends(require_session)])
 
 #  The reader flow is stateless (search / parse / fetch) and may be opened up
 #  read-only with FUNREAD_READER_PUBLIC=1; writes still need an identity.

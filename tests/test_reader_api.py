@@ -81,6 +81,7 @@ def test_scan_reports_what_it_enabled(client):
         "complete": 1,
         "needs_js": 0,
         "web_view": 0,
+        "has_explore": 0,
         "enabled": 1,
     }
 
@@ -98,6 +99,7 @@ def test_the_two_source_types_have_separate_pools(client):
         "complete": 0,
         "needs_js": 0,
         "web_view": 0,
+        "has_explore": 0,
         "enabled": 0,
     }
 
@@ -473,3 +475,211 @@ def test_search_reports_how_it_stopped(client):
     assert body["waves"] == 1
     assert body["hits"] == 0
     assert body["elapsed"] >= 0
+
+
+# ------------------------------------------------------------------ 发现页
+
+
+EXPLORE_SOURCE = {
+    **SOURCE,
+    "bookSourceUrl": "https://e.example.com",
+    "bookSourceName": "分类源",
+    "exploreUrl": "玄幻::/list/1\n都市::/list/2",
+    "ruleExplore": {
+        "bookList": "class.r@tag.li",
+        "name": "class.n@text",
+        "author": "class.a@text",
+        "bookUrl": "tag.a@href",
+    },
+}
+
+EXPLORE_PAGES = {
+    "https://e.example.com/list/1": (
+        '<ul class="r"><li><span class="n">剑来</span>'
+        '<span class="a">烽火戏诸侯</span><a href="/b/1">去</a></li></ul>'
+    ),
+}
+
+
+@pytest.fixture
+def explore_client(monkeypatch, tmp_path):
+    """归档里放一个带发现页规则的源。"""
+    hubs = tmp_path / "hubs"
+    path = hubs / "book" / "source" / "0-100" / "7.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"url_id": 7, "status": 2, "candidate": [{"source": EXPLORE_SOURCE}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'explore.db'}")
+    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(hubs))
+
+    reset_reader_services()
+    with TestClient(create_app()) as test_client:
+        service = get_reader_service()
+        service.fetcher_factory = lambda timeout=None: StaticFetcher(EXPLORE_PAGES)
+        service.registry.scan()
+        yield test_client
+    reset_reader_services()
+
+
+def test_explore_sources_lists_the_browsable_ones(explore_client):
+    page = explore_client.get("/api/v1/reader/explore/sources").json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["url_id"] == 7
+    assert page["items"][0]["kinds"] == ["玄幻", "都市"]
+
+
+def test_explore_sources_is_empty_when_no_source_declares_them(client):
+    """主夹具的源只能搜，不能浏览 —— 不该出现在发现页里。"""
+    assert client.get("/api/v1/reader/explore/sources").json()["total"] == 0
+
+
+def test_explore_kinds_returns_opaque_tokens(explore_client):
+    kinds = explore_client.get("/api/v1/reader/explore/kinds", params={"url_id": 7}).json()
+
+    assert [k["name"] for k in kinds] == ["玄幻", "都市"]
+    #  原样声明的串，不是绝对地址
+    assert kinds[0]["url"] == "/list/1"
+
+
+def test_explore_kinds_on_a_source_without_them_is_a_404(client):
+    assert client.get(
+        "/api/v1/reader/explore/kinds", params={"url_id": 1}
+    ).status_code == 404
+
+
+def test_explore_browses_a_category(explore_client):
+    kinds = explore_client.get("/api/v1/reader/explore/kinds", params={"url_id": 7}).json()
+    page = explore_client.get(
+        "/api/v1/reader/explore", params={"url_id": 7, "url": kinds[0]["url"]}
+    ).json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["name"] == "剑来"
+    #  形状和搜索一致，详情页那条链不必分两种情况
+    assert page["items"][0]["sources"] == [
+        {"url_id": 7, "source_name": "分类源", "book_url": "https://e.example.com/b/1"}
+    ]
+
+
+def test_explore_on_a_dead_category_is_a_502(explore_client):
+    response = explore_client.get(
+        "/api/v1/reader/explore", params={"url_id": 7, "url": "/list/2"}
+    )
+    assert response.status_code == 502
+
+
+def test_scan_counts_explore_capable_sources(explore_client):
+    report = explore_client.post("/api/v1/reader/scan").json()
+    assert report["has_explore"] == 1
+
+
+# ------------------------------------------------------------------ 候选源池
+
+
+def test_pool_lists_sources_with_a_summary(client):
+    """这张表的数据一直存着，在这组端点之前完全没有出口。"""
+    client.post("/api/v1/reader/scan")
+
+    page = client.get("/api/v1/pool").json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["url_id"] == 1
+    assert page["items"][0]["enabled"] is True
+    assert page["items"][0]["is_complete"] is True
+    assert page["items"][0]["needs_js"] is False
+    #  汇总是整个分区的，和当前页无关 —— 界面要一眼看到池子健康度
+    assert page["summary"]["total"] == 1
+    assert page["summary"]["enabled"] == 1
+    #  还没实跑过，所以 proven 是 0。这个数字才是真实可用性
+    assert page["summary"]["proven"] == 0
+
+
+def test_pool_records_proven_sources_after_a_real_run(client):
+    client.post("/api/v1/reader/scan")
+    client.get("/api/v1/reader/search", params={"keyword": "剑来"})
+
+    page = client.get("/api/v1/pool").json()
+
+    assert page["summary"]["proven"] == 1
+    assert page["items"][0]["last_ok_at"]
+
+
+def test_pool_surfaces_why_a_source_failed(client):
+    """在这之前「某个源为什么失败」只存在库里，界面看不到。"""
+    client.post("/api/v1/reader/scan")
+    client.get("/api/v1/reader/search", params={"keyword": "查无此书"})
+
+    page = client.get("/api/v1/pool", params={"state": "failing"}).json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["fail_count"] >= 1
+    assert page["items"][0]["last_error"]
+
+
+def test_pool_filters_by_state_and_keyword(client):
+    client.post("/api/v1/reader/scan")
+
+    assert client.get("/api/v1/pool", params={"state": "enabled"}).json()["total"] == 1
+    assert client.get("/api/v1/pool", params={"state": "disabled"}).json()["total"] == 0
+    assert client.get("/api/v1/pool", params={"q": "甲"}).json()["total"] == 1
+    assert client.get("/api/v1/pool", params={"q": "没有"}).json()["total"] == 0
+
+
+def test_pool_separates_the_two_source_types(client):
+    client.post("/api/v1/reader/scan")
+
+    assert client.get("/api/v1/pool", params={"source_type": "book"}).json()["total"] == 1
+    assert client.get("/api/v1/pool", params={"source_type": "rss"}).json()["total"] == 0
+
+
+def test_pool_disable_and_reenable_a_source(client):
+    """手动停用一个返回垃圾的源 —— 在这之前做不到。"""
+    client.post("/api/v1/reader/scan")
+
+    off = client.patch("/api/v1/pool/book/1", json={"enabled": False}).json()
+    assert off["enabled"] is False
+    #  停用后搜索不该再用它
+    assert client.get("/api/v1/reader/search", params={"keyword": "剑来"}).json()["total"] == 0
+
+    on = client.patch("/api/v1/pool/book/1", json={"enabled": True}).json()
+    assert on["enabled"] is True
+    assert client.get("/api/v1/reader/search", params={"keyword": "剑来"}).json()["total"] == 1
+
+
+def test_pool_reset_failures_gives_a_source_a_second_chance(client):
+    client.post("/api/v1/reader/scan")
+    client.get("/api/v1/reader/search", params={"keyword": "查无此书"})
+    assert client.get("/api/v1/pool").json()["items"][0]["fail_count"] >= 1
+
+    body = client.patch("/api/v1/pool/book/1", json={"reset_failures": True}).json()
+
+    assert body["fail_count"] == 0
+    assert body["last_error"] == ""
+
+
+def test_pool_weight_affects_ordering(client):
+    client.post("/api/v1/reader/scan")
+    body = client.patch("/api/v1/pool/book/1", json={"weight": 50}).json()
+    assert body["weight"] == 50
+
+
+def test_pool_patch_on_an_unknown_source_is_a_404(client):
+    assert client.patch("/api/v1/pool/book/99999", json={"enabled": False}).status_code == 404
+
+
+def test_pool_patch_rejects_an_unknown_source_type(client):
+    assert client.patch("/api/v1/pool/video/1", json={"enabled": False}).status_code == 422
+
+
+def test_pool_is_admin_only(client, monkeypatch):
+    """改一个源的启停会影响所有用户的搜索结果，不该由任意读者改。"""
+    from funread.legado.reader import create_user
+
+    monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    create_user("alice", "password123")
+
+    assert client.get("/api/v1/pool").status_code == 401
+    assert client.patch("/api/v1/pool/book/1", json={"enabled": False}).status_code == 401

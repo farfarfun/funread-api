@@ -162,6 +162,34 @@ class ContentOut(BaseModel):
     next_url: str
 
 
+class ExploreSourceOut(BaseModel):
+    url_id: int
+    name: str
+    #: 分类名，只给当前这一页补（要读源文件）。
+    kinds: list[str] = Field(default_factory=list)
+
+
+class ExploreSourcePage(BaseModel):
+    items: list[ExploreSourceOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class ExploreKindOut(BaseModel):
+    name: str
+    #: 源里**原样声明**的串，不是绝对地址。当**不透明令牌**原样回传给
+    #: `GET /reader/explore` —— 它可能带 URL 选项（`,{"method":"POST"}`），
+    #: 引擎会先拆选项再拼 base_url，自己拼可能把选项弄坏。
+    url: str
+
+
+class ExplorePage(BaseModel):
+    items: list[SearchBookOut]
+    total: int
+    page: int
+
+
 class ScanReport(BaseModel):
     source_type: str
     scanned: int
@@ -169,6 +197,8 @@ class ScanReport(BaseModel):
     needs_js: int
     #: Sources that need a browser (`singleUrl`). Only non-zero for rss.
     web_view: int
+    #: Enabled sources that can also be browsed by category.
+    has_explore: int
     enabled: int
 
 
@@ -276,6 +306,60 @@ def sources_for(
         book_key=report["book_key"],
         name=report["name"],
         **{field: report[field] for field in SearchStats.model_fields},
+    )
+
+
+@router.get("/explore/sources", response_model=ExploreSourcePage)
+def explore_sources(
+    q: str = Query(default="", max_length=64),
+    limit: int = Query(default=30, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> ExploreSourcePage:
+    """Sources whose categories can be browsed.
+
+    The engine has implemented ``explore()`` since M1 but nothing ever called
+    it. Sampling the archive: **54.9% of book sources declare explore rules**,
+    and 19.3% of the sample both declare them and run without JS -- roughly
+    2,500 sources across the full pool.
+
+    This is a table query only (``has_explore`` is computed during scan);
+    category names need the source file, so they are filled in for the current
+    page alone. Needs ``POST /reader/scan`` to have run.
+    """
+    page = get_reader_service().explore_sources(limit=limit, offset=offset, q=q)
+    return ExploreSourcePage(
+        items=[ExploreSourceOut(**item) for item in page["items"]],
+        total=page["total"],
+        limit=page["limit"],
+        offset=page["offset"],
+    )
+
+
+@router.get("/explore/kinds", response_model=list[ExploreKindOut])
+def explore_kinds(url_id: int = Query(ge=1)) -> list[ExploreKindOut]:
+    """One source's browse categories. Touches no network."""
+    with engine_errors():
+        return [ExploreKindOut(**item) for item in get_reader_service().explore_kinds(url_id)]
+
+
+@router.get("/explore", response_model=ExplorePage)
+def explore(
+    url_id: int = Query(ge=1),
+    url: str = Query(min_length=1, max_length=2048),
+    page: int = Query(default=1, ge=1, le=500),
+) -> ExplorePage:
+    """Books in one category of one source.
+
+    Shaped like a search result (each book carries ``sources``) so the detail
+    page does not need a second code path -- here ``sources`` always has
+    exactly one entry, because browsing is a single-source action.
+
+    ``url`` is the opaque token from ``/explore/kinds``, passed back as-is.
+    """
+    with engine_errors():
+        items = get_reader_service().explore(url_id, url, page=page)
+    return ExplorePage(
+        items=[SearchBookOut(**item) for item in items], total=len(items), page=page
     )
 
 
