@@ -3,28 +3,28 @@ set -euo pipefail
 
 # funread-api 是单服务仓库（service 类），所以不再分一层 dispatcher，
 # 验证与生命周期边界都留在这个脚本里。
+#
+# 这个脚本只做转发：进程后台化、PID 文件、存活判定全由 funread-api CLI 自己负责
+# （见 src/funread_api/cli.py），bash 这边不 nohup、不写 PID、不轮询。
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 SERVICE_NAME="api"
-CLI_NAME="funread-api"
+# 允许用 FUNREAD_API_CLI 指到别处，方便在没装进 PATH 的环境里直接试。
+CLI_NAME="${FUNREAD_API_CLI:-funread-api}"
 PKG_NAME="funread-api"
 PORT=18811
-# 留空 = 用 CLI 自己的默认路径
-# ${XDG_CONFIG_HOME:-~/.config}/farfarfun/funread-api/config.toml。
-# 无论哪种，funread-api.pid 都由 CLI 自己写在实际生效的 config 同目录下，
-# 这个脚本从不直接碰那个文件。
-CONFIG_PATH=""
-PYTHON="${PYTHON:-python3}"
 
-readonly ROOT SERVICE_NAME CLI_NAME PKG_NAME PORT CONFIG_PATH PYTHON
+readonly ROOT SERVICE_NAME CLI_NAME PKG_NAME PORT
 
 usage() {
   printf 'Usage: %s <start|stop|restart|run|status|install-dev>\n' "${0##*/}" >&2
   printf '       %s <install-prod|upgrade> [version]\n' "${0##*/}" >&2
   printf '       %s rollback <version>\n' "${0##*/}" >&2
   printf '       %s uninstall\n' "${0##*/}" >&2
+  printf '\n' >&2
+  printf '构建发布不是本脚本的 action：由 dev 仓库根的 `funbuild build` 统一 fan out。\n' >&2
 }
 
 die() {
@@ -32,87 +32,78 @@ die() {
   exit 2
 }
 
-cli_args() {
-  # 本地构建安装与索引固定版本安装暴露的是同一个 CLI，不要按 dev/prod 分支。
-  CLI_ARGS=(--port "${PORT}")
-  # 必须用 if，不能写成 `[[ -n ... ]] && CLI_ARGS+=(...)`：在 set -e 下，
-  # 当 CONFIG_PATH 为空时后者的退出码就是 [[ ]] 自身的 1，而它是函数最后一条
-  # 命令，这个 1 会成为 cli_args 的返回值并直接中止整个脚本。
-  if [[ -n "${CONFIG_PATH}" ]]; then
-    CLI_ARGS+=(--config "${CONFIG_PATH}")
-  fi
-}
-
 require_cli() {
   command -v "${CLI_NAME}" >/dev/null 2>&1 ||
     die "找不到 ${CLI_NAME}，先执行：${0##*/} install-dev（或 install-prod）"
 }
 
+require_uv() {
+  command -v uv >/dev/null 2>&1 || die "找不到 uv，请先安装 uv"
+}
+
 do_start() {
   require_cli
-  cli_args
-  "${CLI_NAME}" server start "${CLI_ARGS[@]}"
+  exec "${CLI_NAME}" server start --port "${PORT}"
 }
 
 do_run() {
   require_cli
-  cli_args
-  exec "${CLI_NAME}" server run "${CLI_ARGS[@]}"
+  exec "${CLI_NAME}" server run --port "${PORT}"
+}
+
+do_restart() {
+  require_cli
+  exec "${CLI_NAME}" server restart --port "${PORT}"
 }
 
 do_stop() {
   require_cli
-  "${CLI_NAME}" server stop
-}
-
-do_restart() {
-  do_stop
-  do_start
+  exec "${CLI_NAME}" server stop
 }
 
 do_status() {
   require_cli
-  "${CLI_NAME}" server status
+  exec "${CLI_NAME}" server status
 }
 
-# 清掉上一次的构建产物与本地安装，从工作树重新构建并强制重装，
-# 保证 ${CLI_NAME} 反映当前源码。
+# 从工作树重新构建并强制重装，保证 ${CLI_NAME} 反映当前源码。
+# 装成 uv tool 而不是 pip install 进共享 site-packages 是故意的：
+# 本机 ~/opt/py312/site-packages 里有非 editable 的旧 funread，装进去会被它遮挡。
 do_install_dev() {
+  require_uv
   rm -rf dist build
-  funbuild install
+  uv sync --extra dev
+  uv build
+  exec uv tool install --reinstall dist/*.whl
 }
 
 # 直接从索引装正式包。CLI 自己装不了自己，所以首装归这个脚本。
 do_install_prod() {
   local version="${1:-}"
-  "${PYTHON}" -m pip install "${PKG_NAME}${version:+==${version}}"
+  require_uv
+  exec uv tool install --reinstall "${PKG_NAME}${version:+==${version}}"
 }
 
 do_upgrade() {
   local version="${1:-}"
   if command -v "${CLI_NAME}" >/dev/null 2>&1; then
-    "${CLI_NAME}" upgrade ${version:+"${version}"}
-  else
-    # CLI 还不存在时退回到包管理器，否则无从 upgrade。
-    if [[ -n "${version}" ]]; then
-      "${PYTHON}" -m pip install "${PKG_NAME}==${version}"
-    else
-      "${PYTHON}" -m pip install --upgrade "${PKG_NAME}"
-    fi
+    exec "${CLI_NAME}" upgrade ${version:+"${version}"}
   fi
+  # CLI 还不存在时退回包管理器，否则无从 upgrade。
+  require_uv
+  exec uv tool install --reinstall "${PKG_NAME}${version:+==${version}}"
 }
 
 do_rollback() {
   local version="$1"
   require_cli
-  "${CLI_NAME}" rollback "${version}"
+  exec "${CLI_NAME}" rollback "${version}"
 }
 
-# 先停服务再卸载，不要卸一个还活着的安装。
+# CLI 的 uninstall 自己会先停服务，这里不重复停一遍。
 do_uninstall() {
-  do_stop || true
   require_cli
-  "${CLI_NAME}" uninstall
+  exec "${CLI_NAME}" uninstall
 }
 
 main() {
@@ -146,6 +137,13 @@ main() {
         die "rollback 必须显式给出版本号"
       }
       do_rollback "$2"
+      ;;
+    publish | build)
+      usage
+      die "${action} 不是本脚本的 action：构建发布由 dev 仓库根的 funbuild build 统一处理"
+      ;;
+    -h | --help | help)
+      usage
       ;;
     *)
       usage

@@ -17,10 +17,10 @@ dependencies = [
 license = "MIT"
 
 [project.scripts]
-funread-api = "funread_api.app:run"
+funread-api = "funread_api.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "httpx>=0.27.0", "ruff>=0.1.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "httpx>=0.27.0", "httpx2>=0.1.0", "ruff>=0.1.0"]
 
 [project.urls]
 Organization = "https://github.com/farfarfun"
@@ -47,9 +47,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/funread_api"]
-
-[tool.uv.sources]
-funread = { path = "../funread", editable = true }
 
 [tool.ruff]
 line-length = 100

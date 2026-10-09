@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -15,12 +14,6 @@ from funread_api.security import auth_enabled
 from funread_api.v1 import api_router
 
 logger = logging.getLogger("funread_api")
-
-#: Default bind address. Loopback, not 0.0.0.0: exposing the service to the
-#: LAN is a deliberate act (reading from a phone), so it takes an explicit
-#: FUNREAD_API_HOST -- and that is exactly when FUNREAD_API_PASSWORD matters.
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 18811
 
 
 @asynccontextmanager
@@ -54,17 +47,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-
-
-def run() -> None:
-    import uvicorn
-
-    uvicorn.run(
-        "funread_api.app:app",
-        host=os.environ.get("FUNREAD_API_HOST", DEFAULT_HOST),
-        port=int(os.environ.get("FUNREAD_API_PORT", DEFAULT_PORT)),
-    )
-
-
-if __name__ == "__main__":
-    run()
