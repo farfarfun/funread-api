@@ -95,7 +95,39 @@ def test_search_without_results_is_an_empty_page_not_an_error(client):
     response = client.get("/api/v1/reader/search", params={"keyword": "查无此书"})
 
     assert response.status_code == 200
-    assert response.json() == {"items": [], "total": 0}
+    body = response.json()
+    assert body["items"] == []
+    assert body["total"] == 0
+    #  The counts are what lets the UI say "all sources failed" rather than
+    #  showing an empty list that looks like "no such book".
+    assert body["sources_tried"] >= 1
+    assert body["sources_ok"] == 0
+    assert body["failed"] >= 1
+
+
+def test_search_reports_how_the_fan_out_went(client):
+    body = client.get("/api/v1/reader/search", params={"keyword": "剑来"}).json()
+
+    assert body["sources_ok"] >= 1
+    assert body["sources_tried"] >= body["sources_ok"]
+    assert body["js_skipped"] == 0
+
+
+def test_search_offset_pages_through_the_round(client):
+    first = client.get(
+        "/api/v1/reader/search", params={"keyword": "剑来", "limit": 1, "offset": 0}
+    ).json()
+    assert first["limit"] == 1
+    assert first["offset"] == 0
+    assert len(first["items"]) <= 1
+
+    beyond = client.get(
+        "/api/v1/reader/search", params={"keyword": "剑来", "limit": 1, "offset": 999}
+    ).json()
+    #  Past the end is an empty window, not an error -- and total still tells
+    #  the client where the end was.
+    assert beyond["items"] == []
+    assert beyond["total"] == first["total"]
 
 
 def test_book_toc_and_content_chain_together(client):
@@ -228,10 +260,58 @@ def test_download_fills_the_cache(client):
     )
 
     assert accepted.status_code == 202
-    assert accepted.json() == {"book_key": book_key, "queued": 2}
+    body = accepted.json()
+    assert body["book_key"] == book_key
+    assert body["queued"] == 2
+    task_id = body["task_id"]
+    assert task_id
+
     #  TestClient drains background tasks before returning, so the work is done
-    assert client.get(f"/api/v1/shelf/{book_key}/cached").json()["chapter_indexes"] == [1, 2]
+    cached = client.get(f"/api/v1/shelf/{book_key}/cached").json()
+    assert cached["chapter_indexes"] == [1, 2]
+    #  Finished, so nothing is in flight any more
+    assert cached["downloading"] is None
+
+    progress = client.get(f"/api/v1/shelf/{book_key}/download/{task_id}").json()
+    assert progress["state"] == "done"
+    assert progress["total"] == 2
+    assert progress["done"] == 2
+    assert progress["failed"] == 0
+
     assert client.delete(f"/api/v1/shelf/{book_key}/cached").json()["chapter_indexes"] == []
+
+
+def test_download_progress_for_an_unknown_task_is_a_404(client):
+    book_key = client.post("/api/v1/shelf", json={"name": "剑来"}).json()["book_key"]
+
+    assert client.get(f"/api/v1/shelf/{book_key}/download/nope").status_code == 404
+
+
+def test_a_failing_download_is_reported_not_left_spinning(client, monkeypatch):
+    """The task runs after the response; an unhandled error would only hit the log."""
+    from funread_api.v1 import deps
+
+    book_key = client.post("/api/v1/shelf", json={"name": "剑来"}).json()["book_key"]
+    service = deps.get_reader_service()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("源站炸了")
+
+    monkeypatch.setattr(service, "download_chapters", _boom)
+
+    accepted = client.post(
+        f"/api/v1/shelf/{book_key}/download",
+        json={
+            "url_id": 1,
+            "interval": 0,
+            "chapters": [{"index": 1, "name": "第一章", "url": "https://a.example.com/c/1"}],
+        },
+    )
+    task_id = accepted.json()["task_id"]
+
+    progress = client.get(f"/api/v1/shelf/{book_key}/download/{task_id}").json()
+    assert progress["state"] == "error"
+    assert "源站炸了" in progress["detail"]
 
 
 def test_download_rejects_an_oversized_batch(client):

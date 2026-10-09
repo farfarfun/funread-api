@@ -37,6 +37,17 @@ class SearchBookOut(BaseModel):
 class SearchPage(BaseModel):
     items: list[SearchBookOut]
     total: int
+    limit: int
+    offset: int
+    #: How the fan-out went this round. Without these the UI cannot tell
+    #: "nothing matched" from "nine of ten sources need JS", and both look
+    #: like a bug to the person holding the phone.
+    sources_tried: int
+    sources_ok: int
+    #: Sources skipped because their rules need a JS runtime. Structural --
+    #: a different keyword will not help, so the UI should say so.
+    js_skipped: int
+    failed: int
 
 
 class BookInfoModel(BaseModel):
@@ -122,15 +133,30 @@ class ScanReport(BaseModel):
 def search(
     keyword: str = Query(min_length=1, max_length=64),
     max_sources: int = Query(default=DEFAULT_SEARCH_SOURCES, ge=1, le=40),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> SearchPage:
     """Search several sources at once and merge hits by 书名+作者.
 
-    Not paginated: every call re-runs a live fan-out, so an ``offset`` would
-    page through a different result set each time. ``limit`` truncates.
+    ``offset`` slices *this* call's result set. Every call re-runs a live
+    fan-out, so page 2 is not guaranteed to continue page 1 -- a source that
+    timed out the first time may answer the second. Ordering is deterministic
+    given the same source responses (most sources first), which makes it good
+    enough for "load more" and wrong for deep paging. ``total`` is the size of
+    this round, so the client can stop asking.
     """
-    results = get_reader_service().search(keyword, max_sources=max_sources)
-    return SearchPage(items=[SearchBookOut(**item) for item in results[:limit]], total=len(results))
+    report = get_reader_service().search_report(keyword, max_sources=max_sources)
+    window = report["items"][offset : offset + limit]
+    return SearchPage(
+        items=[SearchBookOut(**item) for item in window],
+        total=report["total"],
+        limit=limit,
+        offset=offset,
+        sources_tried=report["sources_tried"],
+        sources_ok=report["sources_ok"],
+        js_skipped=report["js_skipped"],
+        failed=report["failed"],
+    )
 
 
 @router.get("/book", response_model=BookInfoModel)
