@@ -3,10 +3,10 @@
 import json
 
 import pytest
+from accounts_support import make_account
 from fastapi.testclient import TestClient
 
 from funread.legado.engine import StaticFetcher
-from funread.legado.reader import create_user
 from funread_api.app import create_app
 from funread_api.v1.deps import get_rss_service, reset_reader_services
 
@@ -372,20 +372,15 @@ def test_state_writes_are_scoped_to_the_subscription(client):
 # ---------------------------------------------------------------- 鉴权
 
 
-def test_subscriptions_do_not_leak_between_accounts(client, monkeypatch):
-    monkeypatch.setenv("FUNREAD_REGISTER_CODE", "letmein")
-    alice = client.post(
-        "/api/v1/auth/register",
-        json={"username": "alice", "password": "password123", "code": "letmein"},
-    )
-    assert alice.status_code == 201
+def test_subscriptions_do_not_leak_between_accounts(client):
+    make_account("alice", "password123")
+    make_account("bob", "password123")
+    login = {"username": "alice", "password": "password123"}
+    assert client.post("/api/v1/auth/login", json=login).status_code == 200
     sub_id = _subscribe_feed(client).json()["sub_id"]
 
     client.post("/api/v1/auth/logout")
-    client.post(
-        "/api/v1/auth/register",
-        json={"username": "bob", "password": "password123", "code": "letmein"},
-    )
+    client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
 
     assert client.get("/api/v1/rss/subscriptions").json() == []
     #  Knowing the id is not access
@@ -394,7 +389,7 @@ def test_subscriptions_do_not_leak_between_accounts(client, monkeypatch):
 
 
 def test_rss_needs_an_identity_once_accounts_exist(client):
-    create_user("alice", "password123")
+    make_account("alice", "password123")
     assert client.get("/api/v1/rss/subscriptions").status_code == 401
     assert _subscribe_feed(client).status_code == 401
 
@@ -403,7 +398,7 @@ def test_reader_public_does_not_open_the_ssrf_endpoint(client, monkeypatch):
     """POST /rss/subscriptions 让服务端拉任意 URL；它不随「公开阅读端」放开。"""
     monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
     monkeypatch.setenv("FUNREAD_READER_PUBLIC", "1")
-    create_user("alice", "password123")
+    make_account("alice", "password123")
 
     assert _subscribe_feed(client).status_code == 401
     assert client.get("/api/v1/rss/sources").status_code == 401

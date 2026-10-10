@@ -390,6 +390,133 @@ def _server_action(arguments: argparse.Namespace) -> int:
     return _status_server(settings)
 
 
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+#
+# Registration is invite-only once the first account exists, so *something*
+# has to be able to mint the first admin and hand out codes without going
+# through HTTP. That something is here rather than an HTTP endpoint on purpose:
+# an endpoint that creates admins is an endpoint that can be found.
+#
+# Everything in this section imports funauth/SQLAlchemy lazily. `server stop`
+# and `status` have to work when the database is unreachable -- and they are the
+# two commands most likely to be run *because* it is.
+
+
+def _prompt_password(confirm: bool = True) -> str:
+    """Read a password from the tty. Never from argv -- that lands in shell history."""
+    import getpass
+
+    password = getpass.getpass("口令: ")
+    if confirm and getpass.getpass("再输一次: ") != password:
+        raise RuntimeError("两次输入的口令不一致")
+    return password
+
+
+async def _with_session(action):
+    """Run ``action(session)`` against the account database, then dispose the engine.
+
+    Disposing matters here and not in the server: aiosqlite runs each
+    connection on its own thread, and a CLI process that exits with one still
+    open hangs instead of returning to the shell.
+    """
+    from funread_api.accounts import (
+        get_async_session_factory,
+        init_auth_db,
+        reset_async_engines,
+    )
+
+    init_auth_db()
+    session_factory = get_async_session_factory()
+    try:
+        async with session_factory() as session:
+            return await action(session)
+    finally:
+        await reset_async_engines()
+
+
+def _accounts_action(arguments: argparse.Namespace) -> int:
+    import asyncio
+
+    from funauth import UsernameTaken, UserRole
+
+    from funread_api.accounts import accounts, validate_credentials
+
+    action = arguments.action
+
+    async def run(session) -> int:
+        if action == "list":
+            users = await accounts.list_users(session)
+            if not users:
+                print("还没有账号。先建一个：funread-api accounts create-admin <用户名>")
+                return 0
+            for user in users:
+                flag = "" if user.is_active else "  [已停用]"
+                print(f"{user.id:>5}  {user.username:<24} {user.role}{flag}")
+            return 0
+
+        if action == "create-admin":
+            password = _prompt_password()
+            try:
+                username = validate_credentials(arguments.username, password)
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
+            try:
+                user = await accounts.create_user(session, username, password, UserRole.ADMIN)
+            except UsernameTaken as error:
+                raise RuntimeError(str(error)) from error
+            print(f"已创建管理员 {user.username}（id={user.id}）")
+            return 0
+
+        if action == "set-password":
+            password = _prompt_password()
+            try:
+                validate_credentials(arguments.username, password)
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
+            if not await accounts.set_password(session, arguments.username, password):
+                raise RuntimeError(f"没有这个账号：{arguments.username}")
+            print(f"已重设 {arguments.username} 的口令")
+            return 0
+
+        if action in {"enable", "disable"}:
+            active = action == "enable"
+            if not await accounts.set_active(session, arguments.username, active):
+                raise RuntimeError(f"没有这个账号：{arguments.username}")
+            print(f"已{'启用' if active else '停用'} {arguments.username}")
+            return 0
+
+        # accounts invite <issue|list|revoke>
+        if arguments.invite_action == "issue":
+            code = await accounts.issue_invite(
+                session,
+                max_uses=arguments.max_uses,
+                expires_in_days=arguments.expires_in_days,
+                note=arguments.note,
+            )
+            print(code.code)
+            return 0
+        if arguments.invite_action == "list":
+            invites = await accounts.list_invites(session)
+            if not invites:
+                print("还没有邀请码。签一张：funread-api accounts invite issue")
+                return 0
+            for invite in invites:
+                status_text = accounts.describe_invite_status(invite)
+                note = f"  # {invite.note}" if invite.note else ""
+                print(
+                    f"{invite.code}  {invite.used_count}/{invite.max_uses}  {status_text}{note}"
+                )
+            return 0
+        if not await accounts.revoke_invite(session, arguments.code):
+            raise RuntimeError(f"没有这张邀请码：{arguments.code}")
+        print(f"已吊销 {arguments.code}")
+        return 0
+
+    return asyncio.run(_with_session(run))
+
+
 def _add_config_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
@@ -422,6 +549,29 @@ def _parser() -> argparse.ArgumentParser:
         _add_config_flag(command)
         command.add_argument("--port", type=int, default=None)
 
+    #  Reader accounts. `dest="action"` is shared with the server group above
+    #  because they are mutually exclusive branches of `main`, never both set.
+    group = subcommands.add_parser("accounts", help="manage reader accounts and invite codes")
+    account_actions = group.add_subparsers(dest="action", required=True)
+    account_actions.add_parser("list", help="list accounts")
+    for action, help_text in (
+        ("create-admin", "create an admin account (password read from the tty)"),
+        ("set-password", "reset an account's password"),
+        ("enable", "re-enable a disabled account"),
+        ("disable", "disable an account without deleting it"),
+    ):
+        command = account_actions.add_parser(action, help=help_text)
+        command.add_argument("username")
+
+    invite = account_actions.add_parser("invite", help="manage registration invite codes")
+    invite_actions = invite.add_subparsers(dest="invite_action", required=True)
+    issue = invite_actions.add_parser("issue", help="issue a code; prints the code value")
+    issue.add_argument("--max-uses", type=int, default=1)
+    issue.add_argument("--expires-in-days", type=int, default=None)
+    issue.add_argument("--note", default=None)
+    invite_actions.add_parser("list", help="list codes with their remaining uses")
+    invite_actions.add_parser("revoke", help="revoke a code").add_argument("code")
+
     upgrade = subcommands.add_parser("upgrade", help="upgrade to the latest or a named version")
     upgrade.add_argument("version", nargs="?")
     rollback = subcommands.add_parser("rollback", help="install a specific earlier version")
@@ -439,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "server":
             return _server_action(arguments)
+        if arguments.command == "accounts":
+            return _accounts_action(arguments)
         if arguments.command == "upgrade":
             return _upgrade(arguments.version)
         if arguments.command == "rollback":

@@ -7,17 +7,19 @@ open plus a startup WARN -- that keeps an existing localhost-only setup working
 instead of breaking it on upgrade.
 
 **Reader (``/web``, the reading front-end).** Real accounts in ``reader_user``,
-scrypt password hashes, and a *different* cookie. The shelf, reading progress
-and subscriptions are per-user, so every query is scoped by ``user_id``.
+run by `funauth` (bcrypt hashes, invite-code registration, two roles), and a
+*different* cookie -- Starlette's signed session cookie, installed by
+``app.py``. The shelf, reading progress and subscriptions are per-user, so
+every query is scoped by ``user_id``.
 
 Keeping them apart is the point: logging in to read must not grant access to
 the collection console, and the console's shared password must not identify a
 reader. Both cookies are ``secure=False`` because this is reached over plain
 http on a LAN -- which is also exactly why none of it should face the internet.
 
-The reader session is signed with the user's *password hash*, so changing a
-password invalidates that user's outstanding sessions. That is the only
-revocation mechanism, and it is the one a self-hoster actually wants.
+Reader sessions carry **only the user id**, never the role: the role is read
+back from the database on every request, so disabling an account takes effect
+immediately instead of waiting out a month-long cookie.
 """
 
 from __future__ import annotations
@@ -27,16 +29,17 @@ import hmac
 import os
 import time
 from dataclasses import dataclass
+from typing import Annotated, Optional
 
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
+from funauth.contrib.fastapi import CookieSessionStore
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from funread.legado.reader import LOCAL_USER_ID, count_users, get_user
+from funread.legado.reader import LOCAL_USER_ID
+from funread_api.accounts import UserRole, accounts, count_users, get_session
 
 #: Admin console cookie. Pre-shared password, no user record.
 COOKIE_NAME = "funread_session"
-
-#: Reader account cookie. Carries the user id.
-USER_COOKIE_NAME = "funread_user"
 
 #: Sessions last a month. This is a reading app opened from a phone -- being
 #: logged out mid-book is a worse failure than a long-lived cookie on a LAN.
@@ -47,6 +50,10 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: Username reported for the implicit identity used while no account exists.
 LOCAL_USERNAME = "local"
 
+#: Where the reader login state lives. Shared with ``v1/auth.py`` so logging in
+#: and reading the session back are the same mechanism.
+session_store = CookieSessionStore()
+
 
 @dataclass(frozen=True)
 class CurrentUser:
@@ -54,11 +61,16 @@ class CurrentUser:
 
     user_id: int
     username: str
+    role: UserRole = UserRole.GUEST
 
     @property
     def is_local(self) -> bool:
         """True for the implicit accountless identity, not a real account."""
         return self.user_id == LOCAL_USER_ID
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == UserRole.ADMIN
 
 
 LOCAL_USER = CurrentUser(user_id=LOCAL_USER_ID, username=LOCAL_USERNAME)
@@ -102,21 +114,6 @@ def reader_is_public() -> bool:
     return os.environ.get("FUNREAD_READER_PUBLIC", "").strip().lower() in {"1", "true", "yes"}
 
 
-def registration_code() -> str | None:
-    """``FUNREAD_REGISTER_CODE``, or ``None`` when registration is closed.
-
-    Unset means ``POST /auth/register`` returns 403 outright. Defaulting to
-    *closed* is the only safe default: anything that can reach the LAN address
-    could otherwise open an account and spend the server's fetch budget.
-    """
-    value = os.environ.get("FUNREAD_REGISTER_CODE", "").strip()
-    return value or None
-
-
-def registration_open() -> bool:
-    return registration_code() is not None
-
-
 def _sign(password: str, expires_at: int) -> str:
     return hmac.new(
         password.encode("utf-8"), f"v1.{expires_at}".encode(), hashlib.sha256
@@ -156,72 +153,46 @@ def is_authenticated(request: Request) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reader: real accounts
+# Reader: funauth accounts
 # ---------------------------------------------------------------------------
 
-
-def _sign_user(password_hash: str, user_id: int, expires_at: int) -> str:
-    return hmac.new(
-        password_hash.encode("utf-8"), f"r1.{user_id}.{expires_at}".encode(), hashlib.sha256
-    ).hexdigest()
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
-def issue_user_token(user_id: int, password_hash: str, now: float | None = None) -> str:
-    """Mint a reader session token: ``r1.<user_id>.<expires_at>.<hmac>``."""
-    expires_at = int(now if now is not None else time.time()) + SESSION_TTL
-    return f"r1.{user_id}.{expires_at}.{_sign_user(password_hash, user_id, expires_at)}"
-
-
-def resolve_user_token(
-    token: str,
-    *,
-    database_url: str | None = None,
-    now: float | None = None,
-) -> CurrentUser | None:
-    """Verify a reader token and return who it belongs to, or ``None``.
-
-    Every failure mode -- malformed, expired, unknown user, disabled user, bad
-    signature -- collapses to ``None``. The caller turns that into one 401, so
-    a probe cannot tell "no such user" from "wrong signature".
-    """
-    parts = (token or "").split(".")
-    if len(parts) != 4 or parts[0] != "r1":
-        return None
-    try:
-        user_id = int(parts[1])
-        expires_at = int(parts[2])
-    except ValueError:
-        return None
-    if expires_at < (now if now is not None else time.time()):
-        return None
-
-    user = get_user(user_id, database_url=database_url)
-    if user is None or user.disabled:
-        return None
-    if not hmac.compare_digest(parts[3], _sign_user(user.password_hash, user_id, expires_at)):
-        return None
-    return CurrentUser(user_id=user.user_id, username=user.username)
-
-
-def current_user(request: Request, *, database_url: str | None = None) -> CurrentUser | None:
+async def resolve_current_user(request: Request, session: AsyncSession) -> Optional[CurrentUser]:
     """Who this request is acting as on the reader side, if anyone.
+
+    Every failure mode of a stale session -- id that isn't an int, deleted
+    account, disabled account -- clears the session and collapses to ``None``,
+    so the caller turns all of them into one 401 and a probe cannot tell them
+    apart.
 
     The implicit local identity is granted only when **both** hold:
 
     - no account exists yet -- the moment someone registers, that fallback is
-      gone and a cookie is required, or the first account's shelf would be
+      gone and a login is required, or the first account's shelf would be
       readable by anyone on the LAN; and
     - the admin guard is satisfied, which with no password configured means
       "trivially". So a fresh clone and CI keep working untouched, while a
       setup that had set ``FUNREAD_API_PASSWORD`` to lock everything down does
       not silently lose that protection by upgrading into accounts.
     """
-    resolved = resolve_user_token(
-        request.cookies.get(USER_COOKIE_NAME, ""), database_url=database_url
-    )
-    if resolved is not None:
-        return resolved
-    if count_users(database_url=database_url) == 0 and is_authenticated(request):
+    raw = session_store.current(request)
+    if raw:
+        try:
+            user_id = int(raw)
+        except (TypeError, ValueError):
+            #  A cookie from the previous session scheme, or a rotated secret.
+            #  "Please log in again" is the right answer, not a 500.
+            session_store.logout(request)
+            return None
+        user = await accounts.get_by_id(session, user_id)
+        if user is None or not user.is_active:
+            session_store.logout(request)
+            return None
+        return CurrentUser(user_id=int(user.id), username=user.username, role=user.role)
+
+    if await count_users(session) == 0 and is_authenticated(request):
         return LOCAL_USER
     return None
 
@@ -235,35 +206,62 @@ def _unauthorized() -> HTTPException:
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录")
 
 
+async def get_current_user(request: Request, session: SessionDep) -> Optional[CurrentUser]:
+    """The reader identity as a dependency, ``None`` when there is none.
+
+    FastAPI caches dependencies per request, so the guards below share one
+    resolution (and one database round trip) even when several of them apply
+    to the same endpoint.
+    """
+    return await resolve_current_user(request, session)
+
+
+#: ``None`` when nobody is logged in -- for endpoints that decide for themselves.
+OptionalUser = Annotated[Optional[CurrentUser], Depends(get_current_user)]
+
+
 def require_session(request: Request) -> None:
     """Admin console dependency: reject anything without a valid admin session."""
     if not is_authenticated(request):
         raise _unauthorized()
 
 
-def require_reader(request: Request) -> None:
+async def require_reader(request: Request, user: OptionalUser) -> None:
     """Read-only reader endpoints, honouring ``FUNREAD_READER_PUBLIC``.
 
     These are stateless: search, parse, fetch. They carry no user identity, so
     a public reader is a reasonable thing to want (share the LAN address, no
     login prompt). Anything that writes per-user state uses ``require_user``.
     """
-    if is_authenticated(request) or current_user(request) is not None:
+    if is_authenticated(request) or user is not None:
         return
     if request.method in _SAFE_METHODS and reader_is_public():
         return
     raise _unauthorized()
 
 
-def require_user(request: Request) -> CurrentUser:
+async def require_user(user: OptionalUser) -> CurrentUser:
     """Per-user endpoints: shelf, progress, subscriptions.
 
     Never opened up by ``FUNREAD_READER_PUBLIC`` -- that flag is about
     *reading*, and someone else's shelf is not public reading material.
     """
-    user = current_user(request)
     if user is None:
         raise _unauthorized()
+    return user
+
+
+async def require_reader_admin(user: OptionalUser) -> CurrentUser:
+    """Reader-side admin: a logged-in account whose role is ``ADMIN``.
+
+    Distinct from ``require_session``, which is the console's shared password.
+    This one identifies *a person* -- used for issuing invite codes, where
+    "who handed this out" matters.
+    """
+    if user is None:
+        raise _unauthorized()
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员账号")
     return user
 
 
@@ -272,20 +270,20 @@ __all__ = [
     "LOCAL_USER",
     "LOCAL_USERNAME",
     "SESSION_TTL",
-    "USER_COOKIE_NAME",
     "CurrentUser",
+    "OptionalUser",
+    "SessionDep",
     "auth_enabled",
-    "current_user",
+    "get_current_user",
     "is_authenticated",
     "issue_token",
-    "issue_user_token",
     "reader_is_public",
-    "registration_code",
-    "registration_open",
     "require_reader",
+    "require_reader_admin",
     "require_session",
     "require_user",
     "resolve_api_password",
-    "resolve_user_token",
+    "resolve_current_user",
+    "session_store",
     "verify_token",
 ]

@@ -3,23 +3,30 @@
 The two must stay apart -- an admin cookie is not a reader identity and a
 reader cookie does not unlock the console -- and per-user state must never leak
 between accounts.
+
+Reader credentials themselves are funauth's, and funauth tests bcrypt, invite
+consumption and the timing-equalised failure paths on its own side. What is
+tested here is what this service adds on top: who may create the *first*
+account, the pre-funauth password upgrade, and the two cookies' boundaries.
 """
 
 import time
 
 import pytest
-from fastapi.testclient import TestClient
-
-from funread.legado.reader import create_user, storage
-from funread_api.app import create_app
-from funread_api.security import (
-    COOKIE_NAME,
-    USER_COOKIE_NAME,
-    issue_token,
-    issue_user_token,
-    resolve_user_token,
-    verify_token,
+from accounts_support import (
+    issue_invite,
+    legacy_scrypt_hash,
+    make_account,
+    read_password_hash,
+    set_active,
+    set_password_hash,
 )
+from fastapi.testclient import TestClient
+from funauth import UserRole
+
+from funread.legado.reader import storage
+from funread_api.app import create_app
+from funread_api.security import COOKIE_NAME, issue_token, verify_token
 
 
 @pytest.fixture
@@ -29,15 +36,21 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("FUNREAD_DATABASE_URL", url)
     monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(tmp_path / "hubs"))
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
-    monkeypatch.delenv("FUNREAD_REGISTER_CODE", raising=False)
     return monkeypatch
 
 
-def _register(client, username="alice", password="password123", code="letmein"):
+def _register(client, username="alice", password="password123", code=""):
     return client.post(
         "/api/v1/auth/register",
         json={"username": username, "password": password, "code": code},
     )
+
+
+def _bootstrap(client, username="alice", password="password123"):
+    """Claim a fresh install: the first account needs no invite code."""
+    response = _register(client, username=username, password=password)
+    assert response.status_code == 201, response.text
+    return response
 
 
 # ------------------------------------------------------------------ admin token
@@ -62,55 +75,6 @@ def test_malformed_admin_tokens_are_rejected(token):
     assert verify_token(token, "secret") is False
 
 
-# ------------------------------------------------------------------ reader token
-
-
-def test_user_token_round_trips(env):
-    user = create_user("alice", "password123")
-    token = issue_user_token(user.user_id, user.password_hash)
-    resolved = resolve_user_token(token)
-    assert resolved is not None
-    assert (resolved.user_id, resolved.username) == (user.user_id, "alice")
-
-
-def test_user_token_dies_with_a_password_change(env):
-    """The hash is the signing key, so a new password revokes old sessions."""
-    user = create_user("alice", "password123")
-    token = issue_user_token(user.user_id, user.password_hash)
-    session_factory = storage.get_session_factory(None)
-    with session_factory() as session:
-        session.get(storage.ReaderUser, user.user_id).password_hash = storage.hash_password("new")
-        session.commit()
-    assert resolve_user_token(token) is None
-
-
-def test_user_token_for_a_deleted_user_is_rejected(env):
-    assert resolve_user_token(issue_user_token(999, "scrypt$1$1$1$aa$bb")) is None
-
-
-def test_user_token_for_a_disabled_user_is_rejected(env):
-    user = create_user("alice", "password123")
-    token = issue_user_token(user.user_id, user.password_hash)
-    session_factory = storage.get_session_factory(None)
-    with session_factory() as session:
-        session.get(storage.ReaderUser, user.user_id).disabled = True
-        session.commit()
-    assert resolve_user_token(token) is None
-
-
-def test_expired_user_token_is_rejected(env):
-    user = create_user("alice", "password123")
-    token = issue_user_token(user.user_id, user.password_hash, now=time.time() - 365 * 24 * 3600)
-    assert resolve_user_token(token) is None
-
-
-@pytest.mark.parametrize(
-    "token", ["", "garbage", "r1.1.2", "r2.1.99999999999.aa", "r1.x.1.aa", "1.2.3.4"]
-)
-def test_malformed_user_tokens_are_rejected(env, token):
-    assert resolve_user_token(token) is None
-
-
 # ------------------------------------------------------------------ 未配置口令、无账号
 
 
@@ -126,7 +90,6 @@ def test_a_fresh_install_stays_open(env):
     assert state["local"] is True
     assert state["user_id"] == 0
     assert state["auth_required"] is False
-    assert state["register_open"] is False
 
 
 def test_admin_login_without_a_configured_password_is_a_no_op(env):
@@ -196,51 +159,104 @@ def test_a_forged_admin_cookie_does_not_get_in(env):
         assert client.get("/api/v1/sources").status_code == 401
 
 
-# ------------------------------------------------------------------ 注册
+# ------------------------------------------------------------------ 首个账号
 
 
-def test_registration_is_closed_unless_a_code_is_configured(env):
+def test_the_first_account_needs_no_invite_code(env):
+    """There is nobody to issue one yet, so requiring one would be a deadlock."""
     with TestClient(create_app()) as client:
-        response = _register(client)
+        body = _bootstrap(client).json()
 
-    assert response.status_code == 403
-    assert "FUNREAD_REGISTER_CODE" in response.json()["detail"]
-
-
-def test_registration_needs_the_right_code(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
-
-    with TestClient(create_app()) as client:
-        assert _register(client, code="nope").status_code == 403
-        assert _register(client, code="").status_code == 403
-        assert _register(client, code="letmein").status_code == 201
-
-
-def test_registration_logs_you_straight_in(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
-
-    with TestClient(create_app()) as client:
-        response = _register(client)
-        assert response.status_code == 201
-        body = response.json()
         assert body["authenticated"] is True
         assert body["username"] == "alice"
         assert body["local"] is False
         assert body["user_id"] > 0
-        assert "httponly" in response.headers["set-cookie"].lower()
-
+        #  Whoever claims the box is its admin -- they can then issue codes.
+        assert body["role"] == UserRole.ADMIN
         assert client.get("/api/v1/shelf").status_code == 200
 
 
-def test_duplicate_username_is_a_conflict(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
+def test_bootstrapping_requires_the_admin_password_when_one_is_set(env):
+    """Otherwise a registration would walk straight through a deliberate lockdown."""
+    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
 
     with TestClient(create_app()) as client:
-        assert _register(client).status_code == 201
-        again = _register(client)
+        refused = _register(client)
+        assert refused.status_code == 403
+        assert "管理口令" in refused.json()["detail"]
 
-    assert again.status_code == 409
-    assert "已被占用" in again.json()["detail"]
+        client.post("/api/v1/auth/admin/login", json={"password": "hunter2"})
+        assert _register(client).status_code == 201
+
+
+def test_the_first_account_inherits_the_accountless_era_data(env):
+    """The shelf built before accounts existed belongs to whoever registers first."""
+    with TestClient(create_app()) as client:
+        added = client.post("/api/v1/shelf", json={"name": "剑来", "author": "烽火"})
+        assert added.status_code == 201
+
+        _bootstrap(client)
+
+        shelf = client.get("/api/v1/shelf").json()
+
+    assert [book["name"] for book in shelf] == ["剑来"]
+
+
+# ------------------------------------------------------------------ 邀请码注册
+
+
+def test_the_second_account_needs_a_valid_invite_code(env):
+    with TestClient(create_app()) as client:
+        _bootstrap(client)
+        client.post("/api/v1/auth/logout")
+
+        assert _register(client, username="bob").status_code == 400
+        assert _register(client, username="bob", code="NOPE").status_code == 400
+
+        code = issue_invite()
+        created = _register(client, username="bob", code=code)
+
+    assert created.status_code == 201
+    #  Self-service registration never produces an admin, whoever handed the
+    #  code out -- a leaked code must not be a leaked console.
+    assert created.json()["role"] == UserRole.GUEST
+
+
+def test_an_invite_code_is_spent_once(env):
+    with TestClient(create_app()) as client:
+        _bootstrap(client)
+        code = issue_invite(max_uses=1)
+
+        assert _register(client, username="bob", code=code).status_code == 201
+        second = _register(client, username="carol", code=code)
+
+    assert second.status_code == 400
+
+
+def test_a_username_collision_gives_the_invite_slot_back(env):
+    """Someone fat-fingering a taken username must not burn the code."""
+    with TestClient(create_app()) as client:
+        _bootstrap(client, username="alice")
+        code = issue_invite(max_uses=1)
+
+        collision = _register(client, username="alice", code=code)
+        assert collision.status_code == 409
+        assert "已存在" in collision.json()["detail"]
+
+        assert _register(client, username="bob", code=code).status_code == 201
+
+
+def test_registration_can_be_closed_outright(env):
+    """``FUNREAD_REGISTER_OPEN=0`` shuts the door even on a live code."""
+    with TestClient(create_app()) as client:
+        _bootstrap(client)
+        code = issue_invite()
+        env.setenv("FUNREAD_REGISTER_OPEN", "0")
+
+        refused = _register(client, username="bob", code=code)
+
+    assert refused.status_code == 403
+    assert "FUNREAD_REGISTER_OPEN" in refused.json()["detail"]
 
 
 @pytest.mark.parametrize(
@@ -248,8 +264,6 @@ def test_duplicate_username_is_a_conflict(env):
     [("ab", "password123"), ("has space", "password123"), ("alice", "short")],
 )
 def test_bad_registration_input_is_a_400(env, username, password):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
-
     with TestClient(create_app()) as client:
         response = _register(client, username=username, password=password)
 
@@ -257,18 +271,23 @@ def test_bad_registration_input_is_a_400(env, username, password):
 
 
 def test_accounts_probe_reports_a_count_not_a_user_list(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
-
     with TestClient(create_app()) as client:
         assert client.get("/api/v1/auth/accounts").json() == {
             "users": 0,
             "register_open": True,
             "min_password_length": 8,
+            #  Tells the sign-up form not to ask for an invite code yet
+            "bootstrap": True,
         }
-        _register(client)
+        _bootstrap(client)
         body = client.get("/api/v1/auth/accounts").json()
 
-    assert body["users"] == 1
+    assert body == {
+        "users": 1,
+        "register_open": True,
+        "min_password_length": 8,
+        "bootstrap": False,
+    }
     assert "alice" not in str(body)
 
 
@@ -276,10 +295,8 @@ def test_accounts_probe_reports_a_count_not_a_user_list(env):
 
 
 def test_reader_login_then_logout(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
-
     with TestClient(create_app()) as client:
-        _register(client)
+        _bootstrap(client)
         client.post("/api/v1/auth/logout")
         assert client.get("/api/v1/shelf").status_code == 401
 
@@ -292,10 +309,11 @@ def test_reader_login_then_logout(env):
 
 
 def test_reader_login_failures_are_indistinguishable(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
+    """Three different causes, one answer -- otherwise this is a username oracle."""
+    make_account("alice", "password123")
+    make_account("carol", "password123", UserRole.GUEST)
 
     with TestClient(create_app()) as client:
-        _register(client)
         wrong_password = client.post(
             "/api/v1/auth/login", json={"username": "alice", "password": "nope"}
         )
@@ -307,21 +325,83 @@ def test_reader_login_failures_are_indistinguishable(env):
     assert wrong_password.json() == unknown_user.json()
 
 
+def test_a_disabled_account_cannot_log_in(env):
+    make_account("alice", "password123")
+    set_active("alice", False)
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_disabling_an_account_kills_its_live_session(env):
+    """The session carries only the id, so the role and the enabled flag are
+    re-read every request -- that is the whole reason it carries only the id."""
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        assert client.get("/api/v1/shelf").status_code == 200
+
+        set_active("alice", False)
+
+        assert client.get("/api/v1/shelf").status_code == 401
+
+
 def test_once_an_account_exists_the_local_fallback_is_gone(env):
     """Otherwise the first account's shelf would be readable by anyone."""
-    create_user("alice", "password123")
+    make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
         assert client.get("/api/v1/shelf").status_code == 401
         assert client.get("/api/v1/auth/me").json()["authenticated"] is False
 
 
-def test_a_forged_user_cookie_does_not_get_in(env):
-    user = create_user("alice", "password123")
+def test_a_forged_session_cookie_does_not_get_in(env):
+    """The session cookie is signed by Starlette; an unsigned one is ignored."""
+    make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
-        client.cookies.set(USER_COOKIE_NAME, f"r1.{user.user_id}.99999999999.deadbeef")
+        client.cookies.set("session", "eyJ1c2VyX2lkIjogIjEifQ==")
         assert client.get("/api/v1/shelf").status_code == 401
+
+
+# ------------------------------------------------------------------ 旧口令透明升级
+
+
+def test_a_pre_funauth_scrypt_password_still_logs_in_and_gets_upgraded(env):
+    """Upgrading the package must not make everyone reset their password."""
+    make_account("alice", "placeholder-password")
+    set_password_hash("alice", legacy_scrypt_hash("password123"))
+    assert read_password_hash("alice").startswith("scrypt$")
+
+    with TestClient(create_app()) as client:
+        login = client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
+        )
+        assert login.status_code == 200
+        assert login.json()["username"] == "alice"
+        assert client.get("/api/v1/shelf").status_code == 200
+
+    #  Rewritten with bcrypt on the way through, so this path runs once per account
+    assert not read_password_hash("alice").startswith("scrypt$")
+
+
+def test_a_wrong_password_against_a_scrypt_hash_is_a_plain_401(env):
+    """Not a 500 -- funauth's bcrypt verifier never sees the legacy string."""
+    make_account("alice", "placeholder-password")
+    set_password_hash("alice", legacy_scrypt_hash("password123"))
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "wrong-one"}
+        )
+
+    assert response.status_code == 401
+    assert read_password_hash("alice").startswith("scrypt$")
 
 
 # ------------------------------------------------------------------ 两端互不越界
@@ -330,7 +410,7 @@ def test_a_forged_user_cookie_does_not_get_in(env):
 def test_an_admin_cookie_is_not_a_reader_identity(env):
     """Unlocking the console must not hand over someone's shelf."""
     env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    create_user("alice", "password123")
+    make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
         client.post("/api/v1/auth/admin/login", json={"password": "hunter2"})
@@ -341,10 +421,12 @@ def test_an_admin_cookie_is_not_a_reader_identity(env):
 def test_a_reader_cookie_does_not_unlock_the_console(env):
     """Reading is not administering -- POST /sources is an SSRF primitive."""
     env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
+    make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
-        assert _register(client).status_code == 201
+        assert client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
+        ).status_code == 200
         assert client.get("/api/v1/shelf").status_code == 200
         assert client.get("/api/v1/sources").status_code == 401
         assert (
@@ -357,39 +439,40 @@ def test_a_reader_cookie_does_not_unlock_the_console(env):
 
 
 def test_shelves_do_not_leak_between_accounts(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
+    make_account("alice", "password123")
+    make_account("bob", "password123")
 
-    with TestClient(create_app()) as alice:
-        _register(alice, username="alice")
-        added = alice.post("/api/v1/shelf", json={"name": "剑来", "author": "烽火"})
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        added = client.post("/api/v1/shelf", json={"name": "剑来", "author": "烽火"})
         assert added.status_code == 201
         book_key = added.json()["book_key"]
-        assert len(alice.get("/api/v1/shelf").json()) == 1
+        assert len(client.get("/api/v1/shelf").json()) == 1
 
-    with TestClient(create_app()) as bob:
-        _register(bob, username="bob")
-        assert bob.get("/api/v1/shelf").json() == []
+        client.post("/api/v1/auth/logout")
+        client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
+        assert client.get("/api/v1/shelf").json() == []
         #  Knowing the key is not access
         assert (
-            bob.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 1}).status_code
+            client.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 1}).status_code
             == 404
         )
-        assert bob.delete(f"/api/v1/shelf/{book_key}").status_code == 404
-        assert bob.get(f"/api/v1/shelf/{book_key}/cached").status_code == 404
+        assert client.delete(f"/api/v1/shelf/{book_key}").status_code == 404
+        assert client.get(f"/api/v1/shelf/{book_key}/cached").status_code == 404
 
 
 def test_progress_is_per_account(env):
-    env.setenv("FUNREAD_REGISTER_CODE", "letmein")
+    make_account("alice", "password123")
+    make_account("bob", "password123")
 
     with TestClient(create_app()) as client:
-        _register(client, username="alice")
-        added = client.post("/api/v1/shelf", json={"name": "剑来"})
-        book_key = added.json()["book_key"]
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        book_key = client.post("/api/v1/shelf", json={"name": "剑来"}).json()["book_key"]
         client.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 11})
         assert client.get("/api/v1/shelf").json()[0]["progress"]["chapter_index"] == 11
 
         client.post("/api/v1/auth/logout")
-        _register(client, username="bob")
+        client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
         client.post("/api/v1/shelf", json={"name": "剑来"})
         assert client.get("/api/v1/shelf").json()[0]["progress"] is None
 
@@ -410,12 +493,21 @@ def test_reader_public_does_not_open_writes(env):
     """The flag is about letting people *read*, not letting them drive the box."""
     env.setenv("FUNREAD_API_PASSWORD", "hunter2")
     env.setenv("FUNREAD_READER_PUBLIC", "1")
-    create_user("alice", "password123")
+    make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
         assert client.post("/api/v1/reader/scan").status_code == 401
         assert client.get("/api/v1/shelf").status_code == 401
         assert client.post("/api/v1/shelf", json={"name": "剑来"}).status_code == 401
+
+
+def test_reader_public_does_not_open_registration(env):
+    """Bootstrapping is still gated on the admin password, public or not."""
+    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    env.setenv("FUNREAD_READER_PUBLIC", "1")
+
+    with TestClient(create_app()) as client:
+        assert _register(client).status_code == 403
 
 
 def test_reader_public_does_not_open_the_ssrf_endpoint(env):

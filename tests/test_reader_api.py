@@ -675,10 +675,10 @@ def test_pool_patch_rejects_an_unknown_source_type(client):
 
 def test_pool_is_admin_only(client, monkeypatch):
     """改一个源的启停会影响所有用户的搜索结果，不该由任意读者改。"""
-    from funread.legado.reader import create_user
+    from accounts_support import make_account
 
     monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    create_user("alice", "password123")
+    make_account("alice", "password123")
 
     assert client.get("/api/v1/pool").status_code == 401
     assert client.patch("/api/v1/pool/book/1", json={"enabled": False}).status_code == 401

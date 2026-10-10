@@ -1,6 +1,9 @@
+import asyncio
+
 import pytest
 
 from funread.legado.reader import storage
+from funread_api import accounts as accounts_module
 from funread_api import security
 from funread_api.v1.deps import get_download_tracker, reset_reader_services
 
@@ -18,8 +21,13 @@ def _no_ambient_secrets(monkeypatch):
     monkeypatch.setattr(security, "_read_secret", lambda: None)
     monkeypatch.delenv("FUNREAD_API_PASSWORD", raising=False)
     monkeypatch.delenv("FUNREAD_READER_PUBLIC", raising=False)
-    #  Registration is closed by default; a developer's shell must not open it.
-    monkeypatch.delenv("FUNREAD_REGISTER_CODE", raising=False)
+    #  Registration is open by default now that the gate is an invite-code row
+    #  rather than a static env secret; a developer's shell must not close it
+    #  (nor open it) behind the tests' back.
+    monkeypatch.delenv("FUNREAD_REGISTER_OPEN", raising=False)
+    #  A fixed session secret: the real resolver would otherwise read funsecret
+    #  or *write* a key file into the developer's ~/.config.
+    monkeypatch.setenv("FUNREAD_SESSION_SECRET", "test-session-secret")
 
 
 @pytest.fixture(autouse=True)
@@ -43,3 +51,8 @@ def _isolate_database(tmp_path, monkeypatch):
     yield
     reset_reader_services()
     get_download_tracker().clear()
+    #  The account engine is async and cached by URL like the others, but it
+    #  also has to be *disposed*: aiosqlite puts every connection on its own
+    #  thread, and 600-odd tests each leaking one ends the run with
+    #  "cannot schedule new futures after shutdown".
+    asyncio.run(accounts_module.reset_async_engines())
