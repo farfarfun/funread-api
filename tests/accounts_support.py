@@ -43,9 +43,7 @@ def make_account(
     role: UserRole = UserRole.GUEST,
 ) -> int:
     """Create an account the way the CLI does, and return its id."""
-    return _run(
-        lambda session: accounts.create_user(session, username, password, role)
-    ).id
+    return _run(lambda session: accounts.create_user(session, username, password, role)).id
 
 
 def issue_invite(max_uses: int = 1) -> str:

@@ -505,9 +505,7 @@ def _accounts_action(arguments: argparse.Namespace) -> int:
             for invite in invites:
                 status_text = accounts.describe_invite_status(invite)
                 note = f"  # {invite.note}" if invite.note else ""
-                print(
-                    f"{invite.code}  {invite.used_count}/{invite.max_uses}  {status_text}{note}"
-                )
+                print(f"{invite.code}  {invite.used_count}/{invite.max_uses}  {status_text}{note}")
             return 0
         if not await accounts.revoke_invite(session, arguments.code):
             raise RuntimeError(f"没有这张邀请码：{arguments.code}")

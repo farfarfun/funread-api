@@ -71,11 +71,15 @@ def reset_reader_services() -> None:
 
 
 @dataclass
-class DownloadTask:
-    """One in-flight batch download."""
+class BackgroundTask:
+    """One in-flight background job (a batch download, an update check, ...)."""
 
     task_id: str
-    book_key: str
+    #: What the job is *about*, so ``active_for`` can refuse a duplicate. A book
+    #: key for a download; ``""`` for jobs that are per-user rather than per-book
+    #: (checking the whole shelf for updates), which makes "one at a time per
+    #: user" fall out of the same check.
+    scope: str
     user_id: int
     total: int
     done: int = 0
@@ -87,18 +91,23 @@ class DownloadTask:
     finished_at: float | None = None
 
 
-class DownloadTracker:
-    """Which batch downloads are running right now.
+class TaskTracker:
+    """Which background jobs are running right now.
 
-    In-process and deliberately so: it answers "is something fetching this book
+    In-process and deliberately so: it answers "is something fetching this
     at the moment", which is a property of *this* process. The authoritative
     answer to "which chapters do we have" is ``reader_chapter_cache`` in the
-    database, and the UI reads that separately -- so losing this registry on
-    restart costs a spinner, not data.
+    database (and for update checks, ``reader_shelf.last_checked_at``), and the
+    UI reads those separately -- so losing this registry on restart costs a
+    spinner, not data.
 
     Consequence worth knowing: with more than one uvicorn worker a download
     started in worker A is invisible to worker B. The service runs
-    single-process, and the DB-backed chapter list still converges either way.
+    single-process, and the DB-backed state still converges either way.
+
+    One instance per kind of job rather than one shared one: ``active_for``
+    would otherwise see a download when asked about an update check, and the
+    retention cap would let a busy download queue evict check entries.
     """
 
     #: Finished entries are kept this long so a client that polls after the
@@ -109,7 +118,7 @@ class DownloadTracker:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._tasks: Dict[str, DownloadTask] = {}
+        self._tasks: Dict[str, BackgroundTask] = {}
 
     def _evict(self) -> None:
         cutoff = time.time() - self.RETENTION_SECONDS
@@ -128,22 +137,30 @@ class DownloadTracker:
             for task in finished[: len(self._tasks) - self.MAX_ENTRIES]:
                 self._tasks.pop(task.task_id, None)
 
-    def start(self, book_key: str, user_id: int, total: int) -> DownloadTask:
-        task = DownloadTask(
-            task_id=uuid.uuid4().hex, book_key=book_key, user_id=user_id, total=total
-        )
+    def start(self, scope: str, user_id: int, total: int) -> BackgroundTask:
+        task = BackgroundTask(task_id=uuid.uuid4().hex, scope=scope, user_id=user_id, total=total)
         with self._lock:
             self._evict()
             self._tasks[task.task_id] = task
         return task
 
-    def finish(self, task_id: str, stats: Dict[str, int]) -> None:
+    def progress(self, task_id: str, *, done: int, failed: int) -> None:
+        """Mid-flight update. The job stays ``running``."""
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 return
-            task.done = int(stats.get("downloaded", 0)) + int(stats.get("cached", 0))
-            task.failed = int(stats.get("failed", 0))
+            task.done = done
+            task.failed = failed
+
+    def finish(self, task_id: str, *, done: int, failed: int) -> None:
+        """Counts come in already mapped -- each job's stats dict has its own keys."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.done = done
+            task.failed = failed
             task.state = "done"
             task.finished_at = time.time()
 
@@ -156,19 +173,15 @@ class DownloadTracker:
             task.detail = detail[:500]
             task.finished_at = time.time()
 
-    def get(self, task_id: str) -> Optional[DownloadTask]:
+    def get(self, task_id: str) -> Optional[BackgroundTask]:
         with self._lock:
             return self._tasks.get(task_id)
 
-    def active_for(self, book_key: str, user_id: int) -> Optional[DownloadTask]:
-        """The running task for this user's copy of the book, if any."""
+    def active_for(self, scope: str, user_id: int) -> Optional[BackgroundTask]:
+        """The running task for this user and scope, if any."""
         with self._lock:
             for task in self._tasks.values():
-                if (
-                    task.book_key == book_key
-                    and task.user_id == user_id
-                    and task.state == "running"
-                ):
+                if task.scope == scope and task.user_id == user_id and task.state == "running":
                     return task
         return None
 
@@ -178,11 +191,16 @@ class DownloadTracker:
             self._tasks.clear()
 
 
-_download_tracker = DownloadTracker()
+_download_tracker = TaskTracker()
+_update_check_tracker = TaskTracker()
 
 
-def get_download_tracker() -> DownloadTracker:
+def get_download_tracker() -> TaskTracker:
     return _download_tracker
+
+
+def get_update_check_tracker() -> TaskTracker:
+    return _update_check_tracker
 
 
 @contextmanager
@@ -212,11 +230,12 @@ def engine_errors() -> Iterator[None]:
 
 
 __all__ = [
-    "DownloadTask",
-    "DownloadTracker",
+    "BackgroundTask",
+    "TaskTracker",
     "engine_errors",
     "get_download_tracker",
     "get_reader_service",
     "get_rss_service",
+    "get_update_check_tracker",
     "reset_reader_services",
 ]

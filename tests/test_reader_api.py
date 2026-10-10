@@ -480,6 +480,228 @@ def test_search_reports_how_it_stopped(client):
     assert body["elapsed"] >= 0
 
 
+# ------------------------------------------------------------------ 书架分组
+
+
+def _add(client, name, **extra):
+    return client.post("/api/v1/shelf", json={"name": name, **extra}).json()["book_key"]
+
+
+def test_a_new_book_is_ungrouped(client):
+    _add(client, "剑来")
+
+    assert client.get("/api/v1/shelf").json()[0]["group"] == ""
+    #  未分组也是一组，否则界面上这些书没有落脚的地方
+    assert client.get("/api/v1/shelf/groups").json() == [{"name": "", "count": 1}]
+
+
+def test_moving_books_into_a_group_and_filtering_by_it(client):
+    jian = _add(client, "剑来")
+    xian = _add(client, "仙逆")
+
+    moved = client.post("/api/v1/shelf/groups/assign", json={"book_keys": [jian], "group": "玄幻"})
+    assert moved.status_code == 200
+    assert moved.json() == {"affected": 1}
+
+    #  不传 group 是整个书架
+    assert len(client.get("/api/v1/shelf").json()) == 2
+    #  传了就只看这一组
+    grouped = client.get("/api/v1/shelf", params={"group": "玄幻"}).json()
+    assert [item["book_key"] for item in grouped] == [jian]
+    #  传空串 = 只看未分组的，这是「空串当成没传」最容易错的地方
+    ungrouped = client.get("/api/v1/shelf", params={"group": ""}).json()
+    assert [item["book_key"] for item in ungrouped] == [xian]
+
+
+def test_group_listing_counts_each_group(client):
+    jian = _add(client, "剑来")
+    _add(client, "仙逆")
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [jian], "group": "玄幻"})
+
+    #  未分组那组排在最后，界面直接按顺序渲染
+    assert client.get("/api/v1/shelf/groups").json() == [
+        {"name": "玄幻", "count": 1},
+        {"name": "", "count": 1},
+    ]
+
+
+def test_re_adding_a_book_keeps_the_group_it_was_put_in(client):
+    """加书是幂等的 —— 从搜索结果里再点一次不该把书踢回未分组。"""
+    book_key = _add(client, "剑来", author="烽火戏诸侯")
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "玄幻"})
+
+    client.post("/api/v1/shelf", json={"name": "剑来", "author": "烽火戏诸侯"})
+
+    assert client.get("/api/v1/shelf").json()[0]["group"] == "玄幻"
+
+
+def test_adding_a_book_straight_into_a_group(client):
+    client.post("/api/v1/shelf", json={"name": "剑来", "group": "玄幻"})
+
+    assert client.get("/api/v1/shelf").json()[0]["group"] == "玄幻"
+
+
+def test_moving_a_book_out_of_its_group(client):
+    book_key = _add(client, "剑来")
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "玄幻"})
+
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": ""})
+
+    assert client.get("/api/v1/shelf").json()[0]["group"] == ""
+
+
+def test_renaming_a_group(client):
+    book_key = _add(client, "剑来")
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "玄幻"})
+
+    body = client.post("/api/v1/shelf/groups/rename", json={"old": "玄幻", "new": "仙侠"})
+
+    assert body.json() == {"affected": 1}
+    assert client.get("/api/v1/shelf").json()[0]["group"] == "仙侠"
+
+
+def test_dissolving_a_group_sends_its_books_back_to_ungrouped(client):
+    book_key = _add(client, "剑来")
+    client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "玄幻"})
+
+    client.post("/api/v1/shelf/groups/rename", json={"old": "玄幻", "new": ""})
+
+    assert client.get("/api/v1/shelf").json()[0]["group"] == ""
+    assert client.get("/api/v1/shelf/groups").json() == [{"name": "", "count": 1}]
+
+
+def test_renaming_a_group_nobody_has_is_a_404(client):
+    _add(client, "剑来")
+
+    assert (
+        client.post("/api/v1/shelf/groups/rename", json={"old": "玄幻", "new": "仙侠"}).status_code
+        == 404
+    )
+
+
+def test_the_ungrouped_bucket_cannot_be_renamed(client):
+    """「给所有未分组的书起个名」是批量移动，不是重命名 —— 混在一起一次误操作就
+    能把整个书架扫进一个组。"""
+    _add(client, "剑来")
+
+    assert (
+        client.post("/api/v1/shelf/groups/rename", json={"old": "", "new": "玄幻"}).status_code
+        == 422
+    )
+
+
+def test_assigning_with_an_empty_book_list_is_rejected(client):
+    assert (
+        client.post(
+            "/api/v1/shelf/groups/assign", json={"book_keys": [], "group": "玄幻"}
+        ).status_code
+        == 422
+    )
+
+
+def test_assigning_a_book_that_is_not_on_the_shelf_moves_nothing(client):
+    _add(client, "剑来")
+
+    body = client.post(
+        "/api/v1/shelf/groups/assign", json={"book_keys": ["不存在"], "group": "玄幻"}
+    ).json()
+
+    assert body == {"affected": 0}
+
+
+# ------------------------------------------------------------------ 检查更新
+
+
+def test_checking_updates_fills_in_the_chapter_count(client):
+    _add(client, "剑来", url_id=1, book_url="https://a.example.com/b/1")
+
+    accepted = client.post("/api/v1/shelf/check-updates", json={"interval": 0})
+
+    assert accepted.status_code == 202
+    assert accepted.json()["queued"] == 1
+    book = client.get("/api/v1/shelf").json()[0]
+    #  这个假源的目录就是两章
+    assert book["chapter_count"] == 2
+    #  还没读过，所以两章都是未读
+    assert book["unread"] == 2
+    assert book["last_checked_at"]
+    assert book["last_check_error"] == ""
+
+
+def test_the_unread_badge_follows_the_reading_progress(client):
+    book_key = _add(client, "剑来", url_id=1, book_url="https://a.example.com/b/1")
+    client.post("/api/v1/shelf/check-updates", json={"interval": 0})
+
+    client.put(f"/api/v1/shelf/{book_key}/progress", json={"chapter_index": 1})
+
+    assert client.get("/api/v1/shelf").json()[0]["unread"] == 0
+
+
+def test_a_book_with_no_remembered_source_is_recorded_as_a_failure(client):
+    """返回 0 会被记成「这本书没有章节」，未读角标跟着清零 —— 必须是失败。"""
+    _add(client, "剑来")
+
+    accepted = client.post("/api/v1/shelf/check-updates", json={"interval": 0}).json()
+
+    progress = client.get(f"/api/v1/shelf/check-updates/{accepted['task_id']}").json()
+    assert progress["state"] == "done"
+    assert progress["failed"] == 1
+    book = client.get("/api/v1/shelf").json()[0]
+    assert book["chapter_count"] == 0
+    assert book["last_check_error"]
+
+
+def test_check_progress_is_queryable_by_task_id(client):
+    _add(client, "剑来", url_id=1, book_url="https://a.example.com/b/1")
+    task_id = client.post("/api/v1/shelf/check-updates", json={"interval": 0}).json()["task_id"]
+
+    progress = client.get(f"/api/v1/shelf/check-updates/{task_id}").json()
+
+    assert progress == {
+        "task_id": task_id,
+        "state": "done",
+        "total": 1,
+        "done": 1,
+        "failed": 0,
+        "detail": "",
+    }
+
+
+def test_checking_only_the_books_you_asked_for(client):
+    jian = _add(client, "剑来", url_id=1, book_url="https://a.example.com/b/1")
+    _add(client, "仙逆", url_id=1, book_url="https://a.example.com/b/1")
+
+    accepted = client.post(
+        "/api/v1/shelf/check-updates", json={"book_keys": [jian], "interval": 0}
+    ).json()
+
+    assert accepted["queued"] == 1
+    checked = {item["name"]: item["chapter_count"] for item in client.get("/api/v1/shelf").json()}
+    assert checked == {"剑来": 2, "仙逆": 0}
+
+
+def test_checking_an_empty_shelf_is_rejected(client):
+    assert client.post("/api/v1/shelf/check-updates", json={"interval": 0}).status_code == 422
+
+
+def test_a_second_round_while_one_is_running_is_a_409(client):
+    """两轮并行只会把同一批源打两遍。"""
+    from funread_api.v1.deps import get_update_check_tracker
+
+    _add(client, "剑来", url_id=1, book_url="https://a.example.com/b/1")
+    #  手动占住 —— TestClient 会把后台任务跑完才返回，没法自然造出「正在跑」
+    running = get_update_check_tracker().start("", 0, 1)
+
+    response = client.post("/api/v1/shelf/check-updates", json={"interval": 0})
+
+    assert response.status_code == 409
+    assert running.task_id in response.json()["detail"]
+
+
+def test_an_unknown_check_task_is_a_404(client):
+    assert client.get("/api/v1/shelf/check-updates/nope").status_code == 404
+
+
 # ------------------------------------------------------------------ 发现页
 
 

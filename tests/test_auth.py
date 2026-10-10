@@ -424,9 +424,12 @@ def test_a_reader_cookie_does_not_unlock_the_console(env):
     make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
-        assert client.post(
-            "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
+            ).status_code
+            == 200
+        )
         assert client.get("/api/v1/shelf").status_code == 200
         assert client.get("/api/v1/sources").status_code == 401
         assert (
@@ -477,6 +480,53 @@ def test_progress_is_per_account(env):
         assert client.get("/api/v1/shelf").json()[0]["progress"] is None
 
 
+def test_shelf_groups_are_per_account(env):
+    """分组名本身也是个人数据 —— 别人架上有「政治」这一组不该被看见。"""
+    make_account("alice", "password123")
+    make_account("bob", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        book_key = client.post("/api/v1/shelf", json={"name": "剑来"}).json()["book_key"]
+        client.post("/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "玄幻"})
+        assert client.get("/api/v1/shelf/groups").json() == [{"name": "玄幻", "count": 1}]
+
+        client.post("/api/v1/auth/logout")
+        client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
+        assert client.get("/api/v1/shelf/groups").json() == []
+        #  知道 book_key 也动不了别人的书
+        assert client.post(
+            "/api/v1/shelf/groups/assign", json={"book_keys": [book_key], "group": "都市"}
+        ).json() == {"affected": 0}
+        #  知道组名也改不了别人的组
+        assert (
+            client.post(
+                "/api/v1/shelf/groups/rename", json={"old": "玄幻", "new": "被改了"}
+            ).status_code
+            == 404
+        )
+
+        client.post("/api/v1/auth/logout")
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        assert client.get("/api/v1/shelf").json()[0]["group"] == "玄幻"
+
+
+def test_an_update_check_task_belongs_to_the_account_that_started_it(env):
+    from funread_api.v1.deps import get_update_check_tracker
+
+    alice = make_account("alice", "password123")
+    make_account("bob", "password123")
+    #  alice 名下的一个任务，bob 不该查得到进度
+    task = get_update_check_tracker().start("", alice, 1)
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
+        assert client.get(f"/api/v1/shelf/check-updates/{task.task_id}").status_code == 404
+        #  并且 alice 的那一轮不挡 bob 自己开一轮
+        client.post("/api/v1/shelf", json={"name": "剑来"})
+        assert client.post("/api/v1/shelf/check-updates", json={"interval": 0}).status_code == 202
+
+
 # ------------------------------------------------------------------ 公开阅读端
 
 
@@ -519,3 +569,39 @@ def test_reader_public_does_not_open_the_ssrf_endpoint(env):
         response = client.post("/api/v1/sources", json={"url": "http://169.254.169.254/meta"})
 
     assert response.status_code == 401
+
+
+def test_the_database_is_not_selectable_from_the_query_string(env, tmp_path):
+    """没有一个端点可以让调用方指定连哪个库。
+
+    `get_session` 曾经写成 `get_session(database_url=None)` 并直接挂成 FastAPI
+    依赖。FastAPI 把依赖签名里带默认值的标量当查询参数公开，于是 39 个端点上都多
+    出一个 `?database_url=`：谁都能让本服务向他给的主机发起外联，再把注册/登录引
+    到他自己的库上，换一张本服务认的 cookie 回来。所以这里既查契约（不许出现在
+    openapi 里），也查行为（真传了也不生效）。
+    """
+    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    make_account("alice", "password123")
+    elsewhere = tmp_path / "elsewhere.db"
+
+    with TestClient(create_app()) as client:
+        exposed = [
+            f"{method} {route}"
+            for route, item in client.app.openapi()["paths"].items()
+            for method, operation in item.items()
+            for parameter in operation.get("parameters", [])
+            if parameter["in"] == "query" and parameter["name"] == "database_url"
+        ]
+        assert exposed == []
+
+        #  传了也必须被当成无关的查询串忽略，而不是换一个库。
+        assert (
+            client.post(
+                "/api/v1/auth/login",
+                params={"database_url": f"sqlite:///{elsewhere}"},
+                json={"username": "alice", "password": "password123"},
+            ).status_code
+            == 200
+        )
+
+    assert not elsewhere.exists()

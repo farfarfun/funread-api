@@ -112,9 +112,7 @@ async def me(request: Request, user: OptionalUser) -> SessionState:
 
 
 @router.post("/register", response_model=SessionState, status_code=status.HTTP_201_CREATED)
-async def register(
-    payload: RegisterRequest, request: Request, session: SessionDep
-) -> SessionState:
+async def register(payload: RegisterRequest, request: Request, session: SessionDep) -> SessionState:
     """Create a reader account.
 
     Two paths, and which one applies depends only on whether any account exists:
@@ -139,9 +137,7 @@ async def register(
     try:
         username = validate_credentials(payload.username, payload.password)
     except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
-        ) from error
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
 
     is_first = await count_users(session) == 0
     if is_first:
@@ -153,9 +149,7 @@ async def register(
         try:
             user = await accounts.create_user(session, username, payload.password, UserRole.ADMIN)
         except UsernameTaken as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=str(error)
-            ) from error
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     else:
         if not registration_open():
             raise HTTPException(
@@ -173,9 +167,7 @@ async def register(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
             ) from error
         except UsernameTaken as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=str(error)
-            ) from error
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     current = _login(request, user)
     if is_first:
@@ -205,9 +197,7 @@ async def login(payload: LoginRequest, request: Request, session: SessionDep) ->
     try:
         user = await accounts.authenticate(session, payload.username, payload.password)
     except BadCredentials as error:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)
-        ) from error
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
     return _state(request, _login(request, user))
 
 

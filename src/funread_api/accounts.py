@@ -302,11 +302,13 @@ def init_auth_db(database_url: Optional[str] = None) -> None:
     _AUTH_INITIALIZED.add(key)
 
 
-async def get_session(database_url: Optional[str] = None) -> AsyncIterator[AsyncSession]:
-    """FastAPI 的会话依赖。异常时 rollback —— funauth 明确把回滚留给宿主。
+async def open_session(database_url: Optional[str] = None) -> AsyncIterator[AsyncSession]:
+    """开一个账号库会话。异常时 rollback —— funauth 明确把回滚留给宿主。
 
     注册那条路径依赖这个 rollback：用户名撞车时 `register_with_invite` 已经扣掉
     的邀请码名额必须跟着回滚，否则别人手滑输了个重名用户名，这张码就白少一次。
+
+    给程序内的调用方（CLI、脚本、测试）用，可以指定库。HTTP 那侧走 `get_session`。
     """
     init_auth_db(database_url)
     factory = get_async_session_factory(database_url)
@@ -318,6 +320,19 @@ async def get_session(database_url: Optional[str] = None) -> AsyncIterator[Async
         raise
     finally:
         await session.close()
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """FastAPI 的会话依赖。
+
+    **一定不能带参数。** FastAPI 会把依赖签名里带默认值的标量当成查询参数公开
+    出去，于是 `?database_url=` 就成了一个谁都能用的开关：服务端会照着请求里给
+    的连接串去连库。那意味着任何人都能让本服务向他指定的主机发起外联，并把账号
+    的读写（注册、登录）引到他自己的库上，拿到一张本服务认的 session cookie。
+    要指定库的程序内调用方用 `open_session(database_url)`。
+    """
+    async for session in open_session():
+        yield session
 
 
 async def count_users(session: AsyncSession) -> int:
@@ -439,7 +454,9 @@ def resolve_session_secret() -> str:
     except OSError as error:
         #  只读文件系统之类。还是能跑，只是重启后大家要重新登录 —— 说清楚，
         #  别让人以为是 bug。
-        logger.warning(f"会话签名密钥写不进 {path}（{error}），本次启动用临时密钥，重启后需重新登录")
+        logger.warning(
+            f"会话签名密钥写不进 {path}（{error}），本次启动用临时密钥，重启后需重新登录"
+        )
     return secret
 
 
@@ -474,6 +491,7 @@ __all__ = [
     "get_session",
     "init_auth_db",
     "is_legacy_hash",
+    "open_session",
     "registration_open",
     "reset_async_engines",
     "resolve_session_secret",

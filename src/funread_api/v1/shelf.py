@@ -1,8 +1,8 @@
-"""Shelf, reading progress, and offline chapter cache."""
+"""Shelf, groups, update checks, reading progress, and the offline chapter cache."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from funread.legado.reader import (
@@ -12,7 +12,12 @@ from funread.legado.reader import (
 )
 from funread_api.security import CurrentUser, require_user
 
-from .deps import DownloadTracker, get_download_tracker, get_reader_service
+from .deps import (
+    TaskTracker,
+    get_download_tracker,
+    get_reader_service,
+    get_update_check_tracker,
+)
 from .reader import ChapterModel
 
 router = APIRouter(prefix="/shelf", tags=["shelf"])
@@ -21,6 +26,14 @@ router = APIRouter(prefix="/shelf", tags=["shelf"])
 #: between chapters, so a 3,000-chapter book would hold a worker for an hour.
 #: The client walks the toc in slices instead.
 MAX_DOWNLOAD_CHAPTERS = 200
+
+#: Cap on one update-check round. Same reason as the download cap -- the check
+#: is serial with a pause between books -- but a shelf is orders of magnitude
+#: smaller than a toc, so this is high enough that it never bites in practice.
+MAX_CHECK_BOOKS = 500
+
+#: 分组名长度上限。分组是前端的标签，不是实体，没必要给长名字留空间。
+MAX_GROUP_LENGTH = 128
 
 
 class ShelfBookIn(BaseModel):
@@ -32,6 +45,9 @@ class ShelfBookIn(BaseModel):
     book_url: str = ""
     toc_url: str = ""
     last_chapter: str = ""
+    #: 分组。`None`（默认）= 不动现有分组 —— 这个端点是幂等的，从搜索结果里再点
+    #: 一次「加入书架」不该把书从用户分好的组里踢回未分组。空串才是显式「未分组」。
+    group: str | None = Field(default=None, max_length=MAX_GROUP_LENGTH)
 
 
 class ProgressIn(BaseModel):
@@ -59,10 +75,67 @@ class ShelfBookOut(BaseModel):
     last_chapter: str
     updated_at: str
     progress: ProgressOut | None
+    group: str = ""
+    #: 上次检查更新时数到的章节数。0 = 还没查过，不是「没有章节」。
+    chapter_count: int = 0
+    #: 未读章节数，由 `chapter_count` 和进度**算出来**的，不落库 —— 存一份就得在
+    #: 每次保存进度时同步维护，而它随时能算。
+    unread: int = 0
+    #: 空串 = 还没查过。沿用 `updated_at` 的约定，不用 `null`。
+    last_checked_at: str = ""
+    #: 上次检查失败的原因。成功一次就清掉。
+    last_check_error: str = ""
 
 
 class BookKeyOut(BaseModel):
     book_key: str
+
+
+class ShelfGroupOut(BaseModel):
+    name: str
+    count: int
+
+
+class AssignGroupIn(BaseModel):
+    #: 要移动的书。空列表直接 400 —— 让它静默返回 0 只会让前端的 bug 更难发现。
+    book_keys: list[str] = Field(min_length=1, max_length=MAX_CHECK_BOOKS)
+    #: 目标分组。空串 = 移出分组。
+    group: str = Field(default="", max_length=MAX_GROUP_LENGTH)
+
+
+class RenameGroupIn(BaseModel):
+    #: 原分组名。不接受空串 —— 「给所有未分组的书起个名」是批量移动（用
+    #: `/groups/assign`），不是重命名，混在一起会让一次误操作扫掉整个书架。
+    old: str = Field(min_length=1, max_length=MAX_GROUP_LENGTH)
+    #: 新分组名。空串 = 解散这个分组，书退回未分组。
+    new: str = Field(default="", max_length=MAX_GROUP_LENGTH)
+
+
+class AffectedOut(BaseModel):
+    #: 动了几本书。前端用它说「已移动 N 本」。
+    affected: int
+
+
+class CheckUpdatesIn(BaseModel):
+    #: 要检查哪几本。`None` = 整个书架。
+    book_keys: list[str] | None = Field(default=None, max_length=MAX_CHECK_BOOKS)
+    #: 每本之间停多久。暴露出来是给测试和「我就查一本」用的。
+    interval: float = Field(default=1.0, ge=0, le=5)
+
+
+class CheckUpdatesAccepted(BaseModel):
+    task_id: str
+    queued: int
+
+
+class CheckProgress(BaseModel):
+    task_id: str
+    state: str
+    total: int
+    #: 已经查完的本数（成功的）。
+    done: int
+    failed: int
+    detail: str = ""
 
 
 class SwitchSourceIn(BaseModel):
@@ -134,8 +207,18 @@ def _require_shelf_book(book_key: str, user: CurrentUser) -> None:
 
 
 @router.get("", response_model=list[ShelfBookOut])
-def list_books(user: CurrentUser = Depends(require_user)) -> list[ShelfBookOut]:
-    return [ShelfBookOut(**item) for item in get_reader_service().shelf(user_id=user.user_id)]
+def list_books(
+    group: str | None = Query(
+        default=None,
+        max_length=MAX_GROUP_LENGTH,
+        description="分组过滤。不传 = 整个书架，传空串 = 只看未分组的书。",
+    ),
+    user: CurrentUser = Depends(require_user),
+) -> list[ShelfBookOut]:
+    return [
+        ShelfBookOut(**item)
+        for item in get_reader_service().shelf(user_id=user.user_id, group=group)
+    ]
 
 
 @router.post("", response_model=BookKeyOut, status_code=status.HTTP_201_CREATED)
@@ -148,6 +231,126 @@ def add_book(
         payload.model_dump(exclude_none=True), user_id=user.user_id
     )
     return BookKeyOut(book_key=book_key)
+
+
+#  分组与检查更新的路由必须排在 `/{book_key}` 之前 —— 否则 `/shelf/groups` 会被
+#  当成 book_key="groups" 匹配掉。
+@router.get("/groups", response_model=list[ShelfGroupOut])
+def list_groups(user: CurrentUser = Depends(require_user)) -> list[ShelfGroupOut]:
+    """这个人书架上的分组，带本数。未分组那一组名字是空串，排在最后。"""
+    return [ShelfGroupOut(**item) for item in get_reader_service().shelf_groups(user.user_id)]
+
+
+@router.post("/groups/assign", response_model=AffectedOut)
+def assign_group(
+    payload: AssignGroupIn,
+    user: CurrentUser = Depends(require_user),
+) -> AffectedOut:
+    """把几本书移进一个分组（或移出，`group=""`）。
+
+    不校验这些 book_key 在不在架上：底层 UPDATE 的 WHERE 里带了 `user_id`，不在
+    架上的 key 只是匹配不到行。返回实际动了几本，前端据此判断是否有过期数据。
+    """
+    affected = get_reader_service().set_shelf_group(
+        payload.book_keys, payload.group, user_id=user.user_id
+    )
+    return AffectedOut(affected=affected)
+
+
+@router.post("/groups/rename", response_model=AffectedOut)
+def rename_group(
+    payload: RenameGroupIn,
+    user: CurrentUser = Depends(require_user),
+) -> AffectedOut:
+    """改名，或 `new=""` 解散分组。分组没有自己的表，所以这就是一条 UPDATE。"""
+    affected = get_reader_service().rename_shelf_group(
+        payload.old, payload.new, user_id=user.user_id
+    )
+    if not affected:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这个分组")
+    return AffectedOut(affected=affected)
+
+
+@router.post(
+    "/check-updates",
+    response_model=CheckUpdatesAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def check_updates(
+    payload: CheckUpdatesIn,
+    tasks: BackgroundTasks,
+    user: CurrentUser = Depends(require_user),
+) -> CheckUpdatesAccepted:
+    """重新数一遍每本书的章节数，算出未读角标。
+
+    202 而不是直接给结果：一本书要两个请求，书架上几十本就是几分钟，撑不过任何
+    请求超时。进度查 ``GET /shelf/check-updates/{task_id}``，结果本身落在书架的
+    `chapter_count` / `unread` 上 —— 任务条目掉了也不丢数据。
+
+    一个人同一时刻只允许一轮（``scope=""``）：两轮并行只会把同一批源打两遍。
+    """
+    service = get_reader_service()
+    total = len(service.shelf(user_id=user.user_id, group=None))
+    if payload.book_keys is not None:
+        total = len(set(payload.book_keys))
+    if not total:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有要检查的书"
+        )
+
+    tracker = get_update_check_tracker()
+    running = tracker.active_for("", user.user_id)
+    if running is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"正在检查更新（task_id={running.task_id}）",
+        )
+
+    task = tracker.start("", user.user_id, total)
+
+    def _run() -> None:
+        def _on_progress(stats: dict[str, int]) -> None:
+            tracker.progress(
+                task.task_id, done=stats.get("checked", 0), failed=stats.get("failed", 0)
+            )
+
+        try:
+            stats = service.check_updates(
+                user_id=user.user_id,
+                book_keys=payload.book_keys,
+                interval=payload.interval,
+                on_progress=_on_progress,
+            )
+        except Exception as error:
+            #  和下载那边同一个理由：任务跑在响应之后，异常只会进服务端日志，
+            #  界面会一直转圈。
+            tracker.fail(task.task_id, str(error))
+            return
+        tracker.finish(
+            task.task_id, done=int(stats.get("checked", 0)), failed=int(stats.get("failed", 0))
+        )
+
+    tasks.add_task(_run)
+    return CheckUpdatesAccepted(task_id=task.task_id, queued=total)
+
+
+@router.get("/check-updates/{task_id}", response_model=CheckProgress)
+def check_updates_progress(
+    task_id: str,
+    user: CurrentUser = Depends(require_user),
+) -> CheckProgress:
+    """一轮检查进行到哪了。条目在结束十分钟后清掉，之后书架本身就是答案。"""
+    task = get_update_check_tracker().get(task_id)
+    if task is None or task.user_id != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这个检查任务")
+    return CheckProgress(
+        task_id=task.task_id,
+        state=task.state,
+        total=task.total,
+        done=task.done,
+        failed=task.failed,
+        detail=task.detail,
+    )
 
 
 @router.delete("/{book_key}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
@@ -258,13 +461,19 @@ def download(
             #  only reach the server log, leaving the UI spinning forever.
             tracker.fail(task.task_id, str(error))
             return
-        tracker.finish(task.task_id, stats)
+        tracker.finish(
+            task.task_id,
+            #  已缓存的章节也算「完成」—— 用户要看的是「这批还剩多少」，而不是
+            #  「这批里有几章是刚抓的」。
+            done=int(stats.get("downloaded", 0)) + int(stats.get("cached", 0)),
+            failed=int(stats.get("failed", 0)),
+        )
 
     tasks.add_task(_run)
     return DownloadAccepted(book_key=book_key, queued=len(chapters), task_id=task.task_id)
 
 
-def _progress_of(tracker: DownloadTracker, task_id: str) -> DownloadProgress | None:
+def _progress_of(tracker: TaskTracker, task_id: str) -> DownloadProgress | None:
     task = tracker.get(task_id)
     if task is None:
         return None
@@ -291,7 +500,7 @@ def download_progress(
     """
     _require_shelf_book(book_key, user)
     task = get_download_tracker().get(task_id)
-    if task is None or task.book_key != book_key or task.user_id != user.user_id:
+    if task is None or task.scope != book_key or task.user_id != user.user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这个下载任务")
     return _progress_of(get_download_tracker(), task_id)  # type: ignore[return-value]
 

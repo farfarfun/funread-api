@@ -5,7 +5,11 @@ import pytest
 from funread.legado.reader import storage
 from funread_api import accounts as accounts_module
 from funread_api import security
-from funread_api.v1.deps import get_download_tracker, reset_reader_services
+from funread_api.v1.deps import (
+    get_download_tracker,
+    get_update_check_tracker,
+    reset_reader_services,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -48,9 +52,11 @@ def _isolate_database(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
     reset_reader_services()
     get_download_tracker().clear()
+    get_update_check_tracker().clear()
     yield
     reset_reader_services()
     get_download_tracker().clear()
+    get_update_check_tracker().clear()
     #  The account engine is async and cached by URL like the others, but it
     #  also has to be *disposed*: aiosqlite puts every connection on its own
     #  thread, and 600-odd tests each leaking one ends the run with
