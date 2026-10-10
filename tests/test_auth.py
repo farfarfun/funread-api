@@ -404,6 +404,44 @@ def test_a_wrong_password_against_a_scrypt_hash_is_a_plain_401(env):
     assert read_password_hash("alice").startswith("scrypt$")
 
 
+def test_a_legacy_account_is_not_distinguishable_by_its_failure_message(env):
+    """A differently-worded 401 would confirm "this account predates funauth",
+    which is one confirmation of the account existing at all."""
+    make_account("alice", "placeholder-password")
+    set_password_hash("alice", legacy_scrypt_hash("password123"))
+    make_account("carol", "password123")
+
+    with TestClient(create_app()) as client:
+        legacy = client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "wrong-one"}
+        )
+        bcrypt = client.post(
+            "/api/v1/auth/login", json={"username": "carol", "password": "wrong-one"}
+        )
+        unknown = client.post(
+            "/api/v1/auth/login", json={"username": "nobody", "password": "wrong-one"}
+        )
+
+    assert legacy.status_code == bcrypt.status_code == unknown.status_code == 401
+    assert legacy.json() == bcrypt.json() == unknown.json()
+
+
+def test_a_disabled_legacy_account_cannot_log_in(env):
+    """`is_active` is checked before the legacy verifier, not after it."""
+    make_account("alice", "placeholder-password")
+    set_password_hash("alice", legacy_scrypt_hash("password123"))
+    set_active("alice", False)
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/v1/auth/login", json={"username": "alice", "password": "password123"}
+        )
+
+    assert response.status_code == 401
+    #  Still scrypt: a disabled account must not get its hash rewritten either.
+    assert read_password_hash("alice").startswith("scrypt$")
+
+
 # ------------------------------------------------------------------ 两端互不越界
 
 

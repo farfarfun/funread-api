@@ -181,19 +181,22 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
 async def login(payload: LoginRequest, request: Request, session: SessionDep) -> SessionState:
     """Log in as a reader. One 401 for every failure -- see funauth's ``authenticate``."""
     existing = await accounts.get_by_username(session, (payload.username or "").strip())
-    if existing is not None and is_legacy_hash(existing.password_hash):
+    if (
+        existing is not None
+        and existing.is_active
+        and is_legacy_hash(existing.password_hash)
+        and verify_legacy_password(payload.password, existing.password_hash)
+    ):
         #  升级前就有的账号：哈希还是 scrypt，bcrypt 验不了。自己验一次，成功就
         #  当场换成 bcrypt —— 每个账号最多走这一次，用户不用重设口令。
         #  不交给 funauth.authenticate 的原因是它只认 bcrypt，会直接当成口令错。
-        if not existing.is_active or not verify_legacy_password(
-            payload.password, existing.password_hash
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或口令不正确"
-            )
         await accounts.set_password(session, existing.username, payload.password)
         return _state(request, _login(request, existing))
 
+    #  失败一律落到 funauth.authenticate 去报，**包括老账号验不过那种** —— 自己抛
+    #  一句措辞不同的 401 就等于告诉探测方「这个账号是升级前建的」，而那是账号
+    #  存在性的一次确认。scrypt 串在 bcrypt 下必然验不过（`verify_password` 对非法
+    #  格式返回 False 而不是抛），所以这条路只会抛，不会把老账号意外放行。
     try:
         user = await accounts.authenticate(session, payload.username, payload.password)
     except BadCredentials as error:
