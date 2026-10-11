@@ -7,13 +7,18 @@ Settings resolution, highest priority first:
 3. the ``FUNREAD_API_HOST`` / ``FUNREAD_API_PORT`` environment variables
 4. the hardcoded loopback defaults
 
-The config file defaults to
-``${XDG_CONFIG_HOME:-~/.config}/farfarfun/funread-api/config.toml`` and is
-parsed by extension (``.toml`` / ``.json`` / ``.env``). Runtime state -- the
-PID and log files -- lives *next to whichever config actually resolved*, not
-in a fixed directory and not relative to the current directory: a host running
-two instances off two configs keeps two independent sets of state, and
-``stop`` works from anywhere.
+The config file defaults to ``~/.farfarfun/funread/api/config.toml`` (see
+``paths.py`` for why that is not under ``XDG_CONFIG_HOME``) and is parsed by
+extension (``.toml`` / ``.json`` / ``.env``). Runtime state -- the PID and log
+files -- lives *next to whichever config actually resolved*, not in a fixed
+directory and not relative to the current directory: a host running two
+instances off two configs keeps two independent sets of state, and ``stop``
+works from anywhere.
+
+Installs predating 1.1.114 kept all of this under
+``${XDG_CONFIG_HOME:-~/.config}/farfarfun/funread-api/``; the config file and
+the session secret are moved across on first run, see
+``paths.migrate_legacy_state``.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ import tomllib
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+from funread_api.paths import default_config_path, migrate_legacy_state
 
 PACKAGE_NAME = "funread-api"
 CLI_NAME = "funread-api"
@@ -70,8 +77,7 @@ class Settings:
 
 
 def _default_config_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(base) / "farfarfun" / CLI_NAME / "config.toml"
+    return default_config_path()
 
 
 def _parse_env_file(text: str) -> dict[str, str]:
@@ -148,7 +154,14 @@ def _coerce_port(value: object, *, source: str) -> int:
 
 def _resolve_settings(arguments: argparse.Namespace) -> Settings:
     explicit = getattr(arguments, "config", None)
-    config_path = Path(explicit).expanduser() if explicit else _default_config_path()
+    if explicit:
+        config_path = Path(explicit).expanduser()
+    else:
+        # 只在走默认路径时迁移：显式 --config 指的是用户自己管的文件，不该被动过。
+        # 放在读配置之前 —— 旧位置那份 config.toml 得先搬过来才读得到。
+        for name in migrate_legacy_state():
+            print(f"已从旧配置目录迁移 {name} -> {default_config_path().parent}")
+        config_path = _default_config_path()
     config = _read_config(config_path, explicit=explicit is not None)
 
     host = getattr(arguments, "host", None)
@@ -521,7 +534,7 @@ def _add_config_flag(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help=(
             "config file (.toml/.json/.env); defaults to "
-            "${XDG_CONFIG_HOME:-~/.config}/farfarfun/funread-api/config.toml. "
+            "~/.farfarfun/funread/api/config.toml. "
             "The PID and log files live in the same directory."
         ),
     )

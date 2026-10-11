@@ -134,6 +134,11 @@ def test_start_refuses_a_second_instance_on_the_same_config(tmp_path):
 
 
 def _settings(monkeypatch, tmp_path, *arguments: str) -> cli.Settings:
+    # 必须隔离 HOME：默认路径是 ``~/.farfarfun/funread/api/``，不改 HOME 的话这些用例会
+    # 读到开发机上真实的那份 config.toml（断言随机失败），而走默认路径还会触发一次迁移，
+    # 把真实旧目录里的 session-secret 搬走。XDG_CONFIG_HOME 一起指到 tmp 下，是为了让
+    # paths.legacy_state_dir() 也落在 tmp 里 —— 它按老办法算，仍然看这个变量。
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     namespace = cli._parser().parse_args(["server", "run", *arguments])
     return cli._resolve_settings(namespace)
@@ -145,7 +150,9 @@ def test_defaults_without_any_config(monkeypatch, tmp_path):
     settings = _settings(monkeypatch, tmp_path)
     assert settings.host == cli.DEFAULT_HOST
     assert settings.port == cli.DEFAULT_PORT
-    assert settings.config_path == tmp_path / "xdg" / "farfarfun" / "funread-api" / "config.toml"
+    assert (
+        settings.config_path == tmp_path / "home" / ".farfarfun" / "funread" / "api" / "config.toml"
+    )
 
 
 def test_environment_beats_the_hardcoded_default(monkeypatch, tmp_path):

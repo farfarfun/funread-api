@@ -55,6 +55,7 @@ from sqlalchemy.pool import NullPool
 
 from funread.base.config import is_sqlite_url
 from funread.legado.manage.source.storage import _get_database_url, _get_engine
+from funread_api.paths import migrate_legacy_state, state_dir
 
 logger = logging.getLogger("funread_api")
 
@@ -409,8 +410,14 @@ SESSION_SECRET_FILENAME = "session-secret"
 
 
 def _config_dir() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "farfarfun" / "funread-api"
+    """路径与迁移都归 ``paths`` 管，这里不再自己算一遍（1.1.114 之前是两份实现）。
+
+    迁移在这儿也调一次：``resolve_session_secret`` 可能不经 CLI 就被用到（直接拿
+    ASGI app 起服务时），那条路径上没人替它把旧位置的密钥搬过来。``migrate_legacy_state``
+    是幂等的，重复调不要紧；这里不打印，迁移提示由 CLI 负责。
+    """
+    migrate_legacy_state()
+    return state_dir()
 
 
 def resolve_session_secret() -> str:
