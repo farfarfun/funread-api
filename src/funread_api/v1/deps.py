@@ -196,6 +196,8 @@ class TaskTracker:
 
 _download_tracker = TaskTracker()
 _update_check_tracker = TaskTracker()
+#  批量测试是**管理端**动作，按 scope 和发起人分开跟踪，不和读者的下载挤同一个池子
+_source_test_tracker = TaskTracker()
 
 
 def get_download_tracker() -> TaskTracker:
@@ -204,6 +206,10 @@ def get_download_tracker() -> TaskTracker:
 
 def get_update_check_tracker() -> TaskTracker:
     return _update_check_tracker
+
+
+def get_source_test_tracker() -> TaskTracker:
+    return _source_test_tracker
 
 
 @contextmanager
@@ -239,6 +245,7 @@ __all__ = [
     "get_download_tracker",
     "get_reader_service",
     "get_rss_service",
+    "get_source_test_tracker",
     "get_update_check_tracker",
     "reset_reader_services",
 ]
