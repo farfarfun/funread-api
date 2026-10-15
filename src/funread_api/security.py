@@ -73,7 +73,13 @@ class CurrentUser:
         return self.role == UserRole.ADMIN
 
 
-LOCAL_USER = CurrentUser(user_id=LOCAL_USER_ID, username=LOCAL_USERNAME)
+#: 零账号时的隐式身份，**角色是 ADMIN**。它代表「这台机器的主人」：只有在一个
+#: 账号都还没有、且管理端守卫已满足时才会发出去（见 `resolve_current_user`），
+#: 而首注册也正是把第一个账号建成 ADMIN —— 同一个身份，不该因为还没落库就降级。
+#:
+#: 这个角色是管理端在新 clone 与 CI 上开箱即用的唯一依靠：管理端改按角色鉴权之后，
+#: 留着默认的 GUEST 会让一个全新实例连自己的采集台都进不去。
+LOCAL_USER = CurrentUser(user_id=LOCAL_USER_ID, username=LOCAL_USERNAME, role=UserRole.ADMIN)
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from funread_api.security import require_reader, require_session, require_user
+from funread_api.security import require_reader, require_reader_admin, require_user
 
 from .auth import router as auth_router
 from .pool import router as pool_router
@@ -14,15 +14,22 @@ api_router = APIRouter()
 #  /auth is the way in, so it cannot require a session itself.
 api_router.include_router(auth_router)
 
-#  Management endpoints always need the admin password when one is configured.
-#  POST /sources in particular fetches an arbitrary URL server-side (SSRF), so
-#  it must never be reachable via the [auth] reader_public escape hatch, and
-#  never via a mere reader account either -- reading is not administering.
-api_router.include_router(sources_router, dependencies=[Depends(require_session)])
-
-#  /pool 查看与干预候选源池。管理端动作：改一个源的启停会影响**所有用户**的
-#  搜索结果，不该由任意读者改。
-api_router.include_router(pool_router, dependencies=[Depends(require_session)])
+#  管理端按**账号角色**鉴权：必须是登录着的 ADMIN。
+#
+#  以前这里是 `require_session` —— 一个与账号体系平行的预共享口令（[auth]
+#  password）。两套凭据有个要命的缺省行为：口令没配时 `is_authenticated` 恒为
+#  真，于是整个管理端对任何人敞开。一台绑到 0.0.0.0 的实例就这么把采集源管理
+#  暴露在公网上，而服务只在启动日志里提了一句。
+#
+#  角色判断没有这个缺口：没登录就是 401，不是 ADMIN 就是 403，不存在「没配就
+#  全开」的默认值。谁能管也从「谁知道那个口令」变成「库里哪个账号是 admin」，
+#  可查可改可回收。
+#
+#  POST /sources 会让服务端去抓调用方给的任意 URL（SSRF），/pool 改一个源的启停
+#  会影响**所有用户**的搜索结果 —— 两者都不该被 [auth] reader_public 放开，也不
+#  该由普通读者账号够得着：能读不等于能管。
+api_router.include_router(sources_router, dependencies=[Depends(require_reader_admin)])
+api_router.include_router(pool_router, dependencies=[Depends(require_reader_admin)])
 
 #  The reader flow is stateless (search / parse / fetch) and may be opened up
 #  read-only with [auth] reader_public = true; writes still need an identity.
