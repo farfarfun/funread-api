@@ -23,7 +23,6 @@ the session secret are moved across on first run, see
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
@@ -32,9 +31,13 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Annotated
+
+import typer
 
 from funread_api.paths import default_config_path, migrate_legacy_state
 
@@ -152,33 +155,42 @@ def _coerce_port(value: object, *, source: str) -> int:
         raise RuntimeError(f"invalid port from {source}: {value!r}") from None
 
 
-def _resolve_settings(arguments: argparse.Namespace) -> Settings:
-    explicit = getattr(arguments, "config", None)
-    if explicit:
-        config_path = Path(explicit).expanduser()
+def _resolve_settings(
+    *,
+    config: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> Settings:
+    """Fold the CLI flags, the config file, the environment and the defaults.
+
+    ``host`` and ``port`` are ``None`` when the flag was not given -- commands
+    that have no ``--host`` flag at all (``stop`` / ``status`` / ``uninstall``)
+    simply leave it out.
+    """
+    if config:
+        config_path = Path(config).expanduser()
     else:
         # 只在走默认路径时迁移：显式 --config 指的是用户自己管的文件，不该被动过。
         # 放在读配置之前 —— 旧位置那份 config.toml 得先搬过来才读得到。
         for name in migrate_legacy_state():
             print(f"已从旧配置目录迁移 {name} -> {default_config_path().parent}")
         config_path = _default_config_path()
-    config = _read_config(config_path, explicit=explicit is not None)
+    values = _read_config(config_path, explicit=config is not None)
 
-    host = getattr(arguments, "host", None)
-    if host is None:
-        host = config.get("host") or os.environ.get("FUNREAD_API_HOST") or DEFAULT_HOST
+    resolved_host: object = host
+    if resolved_host is None:
+        resolved_host = values.get("host") or os.environ.get("FUNREAD_API_HOST") or DEFAULT_HOST
 
-    port_value = getattr(arguments, "port", None)
-    if port_value is not None:
-        port = port_value
-    elif "port" in config:
-        port = _coerce_port(config["port"], source=f"config file {config_path}")
+    if port is not None:
+        resolved_port = port
+    elif "port" in values:
+        resolved_port = _coerce_port(values["port"], source=f"config file {config_path}")
     elif os.environ.get("FUNREAD_API_PORT"):
-        port = _coerce_port(os.environ["FUNREAD_API_PORT"], source="FUNREAD_API_PORT")
+        resolved_port = _coerce_port(os.environ["FUNREAD_API_PORT"], source="FUNREAD_API_PORT")
     else:
-        port = DEFAULT_PORT
+        resolved_port = DEFAULT_PORT
 
-    return Settings(config_path=config_path, host=str(host), port=port)
+    return Settings(config_path=config_path, host=str(resolved_host), port=resolved_port)
 
 
 # ---------------------------------------------------------------------------
@@ -385,22 +397,122 @@ def _uninstall(settings: Settings) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Command line
 # ---------------------------------------------------------------------------
+#
+# ``add_completion=False`` keeps the option surface to exactly the flags below,
+# and ``pretty_exceptions_enable=False`` keeps an unexpected crash a plain
+# traceback: ``server start``'s stderr goes straight into the log file, where
+# Typer's framed and coloured one would only be harder to read.
+
+app = typer.Typer(
+    help="Manage the funread API service",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+server_app = typer.Typer(help="manage the API service")
+accounts_app = typer.Typer(help="manage reader accounts and invite codes")
+invite_app = typer.Typer(help="manage registration invite codes")
+app.add_typer(server_app, name="server")
+app.add_typer(accounts_app, name="accounts")
+accounts_app.add_typer(invite_app, name="invite")
+
+ConfigOption = Annotated[
+    str | None,
+    typer.Option(
+        "--config",
+        metavar="PATH",
+        help=(
+            "config file (.toml/.json/.env); defaults to "
+            "~/.farfarfun/funread/api/config.toml. "
+            "The PID and log files live in the same directory."
+        ),
+    ),
+]
+# Default None, not DEFAULT_HOST/PORT: _resolve_settings has to be able to tell
+# "the user passed this" from "fall through to the config file".
+HostOption = Annotated[str | None, typer.Option("--host")]
+PortOption = Annotated[int | None, typer.Option("--port")]
 
 
-def _server_action(arguments: argparse.Namespace) -> int:
-    settings = _resolve_settings(arguments)
-    if arguments.action == "run":
-        return _run_server(settings)
-    if arguments.action == "start":
-        return _start_server(settings)
-    if arguments.action == "stop":
-        return _stop_server(settings)
-    if arguments.action == "restart":
+def _dispatch(action: Callable[[], int]) -> None:
+    """Run a command body and turn its result into this process' exit code.
+
+    Every command funnels through here so that a ``RuntimeError`` -- the way
+    the helpers above report an expected failure -- stays a one-line ``error:``
+    on stderr with exit status 1 rather than a traceback.
+    """
+    try:
+        code = action()
+    except RuntimeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise typer.Exit(1) from error
+    if code:
+        raise typer.Exit(code)
+
+
+@server_app.command("run")
+def server_run(
+    config: ConfigOption = None, host: HostOption = None, port: PortOption = None
+) -> None:
+    """Run the service in the foreground."""
+    _dispatch(lambda: _run_server(_resolve_settings(config=config, host=host, port=port)))
+
+
+@server_app.command("start")
+def server_start(
+    config: ConfigOption = None, host: HostOption = None, port: PortOption = None
+) -> None:
+    """Start the service in the background."""
+    _dispatch(lambda: _start_server(_resolve_settings(config=config, host=host, port=port)))
+
+
+@server_app.command("restart")
+def server_restart(
+    config: ConfigOption = None, host: HostOption = None, port: PortOption = None
+) -> None:
+    """Stop the background service, then start it again."""
+
+    def action() -> int:
+        settings = _resolve_settings(config=config, host=host, port=port)
         _stop_server(settings)
         return _start_server(settings)
-    return _status_server(settings)
+
+    _dispatch(action)
+
+
+# stop/status take --config and --port but no --host: the former locates the PID
+# file, the latter is the fallback when that file is gone.
+@server_app.command("stop")
+def server_stop(config: ConfigOption = None, port: PortOption = None) -> None:
+    """Stop the background service."""
+    _dispatch(lambda: _stop_server(_resolve_settings(config=config, port=port)))
+
+
+@server_app.command("status")
+def server_status(config: ConfigOption = None, port: PortOption = None) -> None:
+    """Report whether the service is running."""
+    _dispatch(lambda: _status_server(_resolve_settings(config=config, port=port)))
+
+
+# Deliberately absent: an `install` command. A CLI cannot install itself before
+# it exists -- that is `scripts/setup.sh`'s or `uv tool install`'s job.
+@app.command("upgrade")
+def upgrade(version: Annotated[str | None, typer.Argument()] = None) -> None:
+    """upgrade to the latest or a named version"""
+    _dispatch(lambda: _upgrade(version))
+
+
+@app.command("rollback")
+def rollback(version: Annotated[str, typer.Argument()]) -> None:
+    """install a specific earlier version"""
+    _dispatch(lambda: _rollback(version))
+
+
+@app.command("uninstall")
+def uninstall(config: ConfigOption = None, port: PortOption = None) -> None:
+    """stop the service and uninstall the package"""
+    _dispatch(lambda: _uninstall(_resolve_settings(config=config, port=port)))
 
 
 # ---------------------------------------------------------------------------
@@ -449,167 +561,168 @@ async def _with_session(action):
         await reset_async_engines()
 
 
-def _accounts_action(arguments: argparse.Namespace) -> int:
+def _run_account_action(action) -> int:
+    """Run ``action(session)`` against the account database from sync code."""
     import asyncio
 
+    return asyncio.run(_with_session(action))
+
+
+UsernameArgument = Annotated[str, typer.Argument()]
+
+
+@accounts_app.command("list")
+def accounts_list() -> None:
+    """list accounts"""
+    from funread_api.accounts import accounts
+
+    async def run(session) -> int:
+        users = await accounts.list_users(session)
+        if not users:
+            print("还没有账号。先建一个：funread-api accounts create-admin <用户名>")
+            return 0
+        for user in users:
+            flag = "" if user.is_active else "  [已停用]"
+            print(f"{user.id:>5}  {user.username:<24} {user.role}{flag}")
+        return 0
+
+    _dispatch(lambda: _run_account_action(run))
+
+
+@accounts_app.command("create-admin")
+def accounts_create_admin(username: UsernameArgument) -> None:
+    """create an admin account (password read from the tty)"""
     from funauth import UsernameTaken, UserRole
 
     from funread_api.accounts import accounts, validate_credentials
 
-    action = arguments.action
-
     async def run(session) -> int:
-        if action == "list":
-            users = await accounts.list_users(session)
-            if not users:
-                print("还没有账号。先建一个：funread-api accounts create-admin <用户名>")
-                return 0
-            for user in users:
-                flag = "" if user.is_active else "  [已停用]"
-                print(f"{user.id:>5}  {user.username:<24} {user.role}{flag}")
-            return 0
-
-        if action == "create-admin":
-            password = _prompt_password()
-            try:
-                username = validate_credentials(arguments.username, password)
-            except ValueError as error:
-                raise RuntimeError(str(error)) from error
-            try:
-                user = await accounts.create_user(session, username, password, UserRole.ADMIN)
-            except UsernameTaken as error:
-                raise RuntimeError(str(error)) from error
-            print(f"已创建管理员 {user.username}（id={user.id}）")
-            return 0
-
-        if action == "set-password":
-            password = _prompt_password()
-            try:
-                validate_credentials(arguments.username, password)
-            except ValueError as error:
-                raise RuntimeError(str(error)) from error
-            if not await accounts.set_password(session, arguments.username, password):
-                raise RuntimeError(f"没有这个账号：{arguments.username}")
-            print(f"已重设 {arguments.username} 的口令")
-            return 0
-
-        if action in {"enable", "disable"}:
-            active = action == "enable"
-            if not await accounts.set_active(session, arguments.username, active):
-                raise RuntimeError(f"没有这个账号：{arguments.username}")
-            print(f"已{'启用' if active else '停用'} {arguments.username}")
-            return 0
-
-        # accounts invite <issue|list|revoke>
-        if arguments.invite_action == "issue":
-            code = await accounts.issue_invite(
-                session,
-                max_uses=arguments.max_uses,
-                expires_in_days=arguments.expires_in_days,
-                note=arguments.note,
-            )
-            print(code.code)
-            return 0
-        if arguments.invite_action == "list":
-            invites = await accounts.list_invites(session)
-            if not invites:
-                print("还没有邀请码。签一张：funread-api accounts invite issue")
-                return 0
-            for invite in invites:
-                status_text = accounts.describe_invite_status(invite)
-                note = f"  # {invite.note}" if invite.note else ""
-                print(f"{invite.code}  {invite.used_count}/{invite.max_uses}  {status_text}{note}")
-            return 0
-        if not await accounts.revoke_invite(session, arguments.code):
-            raise RuntimeError(f"没有这张邀请码：{arguments.code}")
-        print(f"已吊销 {arguments.code}")
+        password = _prompt_password()
+        try:
+            name = validate_credentials(username, password)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        try:
+            user = await accounts.create_user(session, name, password, UserRole.ADMIN)
+        except UsernameTaken as error:
+            raise RuntimeError(str(error)) from error
+        print(f"已创建管理员 {user.username}（id={user.id}）")
         return 0
 
-    return asyncio.run(_with_session(run))
+    _dispatch(lambda: _run_account_action(run))
 
 
-def _add_config_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--config",
-        metavar="PATH",
-        help=(
-            "config file (.toml/.json/.env); defaults to "
-            "~/.farfarfun/funread/api/config.toml. "
-            "The PID and log files live in the same directory."
-        ),
-    )
+@accounts_app.command("set-password")
+def accounts_set_password(username: UsernameArgument) -> None:
+    """reset an account's password"""
+    from funread_api.accounts import accounts, validate_credentials
+
+    async def run(session) -> int:
+        password = _prompt_password()
+        try:
+            validate_credentials(username, password)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        if not await accounts.set_password(session, username, password):
+            raise RuntimeError(f"没有这个账号：{username}")
+        print(f"已重设 {username} 的口令")
+        return 0
+
+    _dispatch(lambda: _run_account_action(run))
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=CLI_NAME, description="Manage the funread API service")
-    subcommands = parser.add_subparsers(dest="command", required=True)
+def _set_active(username: str, *, active: bool) -> None:
+    from funread_api.accounts import accounts
 
-    server = subcommands.add_parser("server", help="manage the API service")
-    server_actions = server.add_subparsers(dest="action", required=True)
-    for action in ("run", "start", "restart"):
-        command = server_actions.add_parser(action)
-        _add_config_flag(command)
-        # Default None, not DEFAULT_HOST/PORT: _resolve_settings has to be able
-        # to tell "the user passed this" from "fall through to the config file".
-        command.add_argument("--host", default=None)
-        command.add_argument("--port", type=int, default=None)
-    # stop/status need --config and --port too: the former locates the PID file,
-    # the latter is the fallback when that file is gone.
-    for action in ("stop", "status"):
-        command = server_actions.add_parser(action)
-        _add_config_flag(command)
-        command.add_argument("--port", type=int, default=None)
+    async def run(session) -> int:
+        if not await accounts.set_active(session, username, active):
+            raise RuntimeError(f"没有这个账号：{username}")
+        print(f"已{'启用' if active else '停用'} {username}")
+        return 0
 
-    #  Reader accounts. `dest="action"` is shared with the server group above
-    #  because they are mutually exclusive branches of `main`, never both set.
-    group = subcommands.add_parser("accounts", help="manage reader accounts and invite codes")
-    account_actions = group.add_subparsers(dest="action", required=True)
-    account_actions.add_parser("list", help="list accounts")
-    for action, help_text in (
-        ("create-admin", "create an admin account (password read from the tty)"),
-        ("set-password", "reset an account's password"),
-        ("enable", "re-enable a disabled account"),
-        ("disable", "disable an account without deleting it"),
-    ):
-        command = account_actions.add_parser(action, help=help_text)
-        command.add_argument("username")
+    _dispatch(lambda: _run_account_action(run))
 
-    invite = account_actions.add_parser("invite", help="manage registration invite codes")
-    invite_actions = invite.add_subparsers(dest="invite_action", required=True)
-    issue = invite_actions.add_parser("issue", help="issue a code; prints the code value")
-    issue.add_argument("--max-uses", type=int, default=1)
-    issue.add_argument("--expires-in-days", type=int, default=None)
-    issue.add_argument("--note", default=None)
-    invite_actions.add_parser("list", help="list codes with their remaining uses")
-    invite_actions.add_parser("revoke", help="revoke a code").add_argument("code")
 
-    upgrade = subcommands.add_parser("upgrade", help="upgrade to the latest or a named version")
-    upgrade.add_argument("version", nargs="?")
-    rollback = subcommands.add_parser("rollback", help="install a specific earlier version")
-    rollback.add_argument("version")
-    uninstall = subcommands.add_parser(
-        "uninstall", help="stop the service and uninstall the package"
-    )
-    _add_config_flag(uninstall)
-    uninstall.add_argument("--port", type=int, default=None)
-    return parser
+@accounts_app.command("enable")
+def accounts_enable(username: UsernameArgument) -> None:
+    """re-enable a disabled account"""
+    _set_active(username, active=True)
+
+
+@accounts_app.command("disable")
+def accounts_disable(username: UsernameArgument) -> None:
+    """disable an account without deleting it"""
+    _set_active(username, active=False)
+
+
+@invite_app.command("issue")
+def invite_issue(
+    max_uses: Annotated[int, typer.Option("--max-uses")] = 1,
+    expires_in_days: Annotated[int | None, typer.Option("--expires-in-days")] = None,
+    note: Annotated[str | None, typer.Option("--note")] = None,
+) -> None:
+    """issue a code; prints the code value"""
+    from funread_api.accounts import accounts
+
+    async def run(session) -> int:
+        code = await accounts.issue_invite(
+            session,
+            max_uses=max_uses,
+            expires_in_days=expires_in_days,
+            note=note,
+        )
+        print(code.code)
+        return 0
+
+    _dispatch(lambda: _run_account_action(run))
+
+
+@invite_app.command("list")
+def invite_list() -> None:
+    """list codes with their remaining uses"""
+    from funread_api.accounts import accounts
+
+    async def run(session) -> int:
+        invites = await accounts.list_invites(session)
+        if not invites:
+            print("还没有邀请码。签一张：funread-api accounts invite issue")
+            return 0
+        for invite in invites:
+            status_text = accounts.describe_invite_status(invite)
+            note = f"  # {invite.note}" if invite.note else ""
+            print(f"{invite.code}  {invite.used_count}/{invite.max_uses}  {status_text}{note}")
+        return 0
+
+    _dispatch(lambda: _run_account_action(run))
+
+
+@invite_app.command("revoke")
+def invite_revoke(code: Annotated[str, typer.Argument()]) -> None:
+    """revoke a code"""
+    from funread_api.accounts import accounts
+
+    async def run(session) -> int:
+        if not await accounts.revoke_invite(session, code):
+            raise RuntimeError(f"没有这张邀请码：{code}")
+        print(f"已吊销 {code}")
+        return 0
+
+    _dispatch(lambda: _run_account_action(run))
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    """Run the CLI over ``argv`` (``sys.argv[1:]`` when omitted) and return its exit code.
+
+    ``[project.scripts]`` points here, so the return value *is* the process
+    status. Typer always leaves through ``SystemExit`` -- including for
+    ``--help`` and for a usage error, which keeps its status 2 -- so the code is
+    unwrapped rather than propagated.
+    """
     try:
-        if arguments.command == "server":
-            return _server_action(arguments)
-        if arguments.command == "accounts":
-            return _accounts_action(arguments)
-        if arguments.command == "upgrade":
-            return _upgrade(arguments.version)
-        if arguments.command == "rollback":
-            return _rollback(arguments.version)
-        return _uninstall(_resolve_settings(arguments))
-    except RuntimeError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+        app(args=argv, prog_name=CLI_NAME)
+    except SystemExit as exit_signal:
+        return int(exit_signal.code or 0)
+    return 0
 
 
 if __name__ == "__main__":

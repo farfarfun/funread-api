@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -133,15 +132,16 @@ def test_start_refuses_a_second_instance_on_the_same_config(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _settings(monkeypatch, tmp_path, *arguments: str) -> cli.Settings:
+def _settings(monkeypatch, tmp_path, **flags) -> cli.Settings:
     # 必须隔离 HOME：默认路径是 ``~/.farfarfun/funread/api/``，不改 HOME 的话这些用例会
     # 读到开发机上真实的那份 config.toml（断言随机失败），而走默认路径还会触发一次迁移，
     # 把真实旧目录里的 session-secret 搬走。XDG_CONFIG_HOME 一起指到 tmp 下，是为了让
     # paths.legacy_state_dir() 也落在 tmp 里 —— 它按老办法算，仍然看这个变量。
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    namespace = cli._parser().parse_args(["server", "run", *arguments])
-    return cli._resolve_settings(namespace)
+    # ``flags`` 就是 `server run` 那几个选项解析出来的值；选项本身由 Typer 解析，
+    # 端到端那部分由上面的 subprocess 用例覆盖。
+    return cli._resolve_settings(**flags)
 
 
 def test_defaults_without_any_config(monkeypatch, tmp_path):
@@ -175,30 +175,28 @@ def test_config_file_beats_the_environment(monkeypatch, tmp_path, name, body):
     monkeypatch.setenv("FUNREAD_API_PORT", "20099")
     path = tmp_path / name
     path.write_text(body, encoding="utf-8")
-    settings = _settings(monkeypatch, tmp_path, "--config", str(path))
+    settings = _settings(monkeypatch, tmp_path, config=str(path))
     assert (settings.host, settings.port) == ("10.0.0.1", 20002)
 
 
 def test_flags_beat_the_config_file(monkeypatch, tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('host = "10.0.0.1"\nport = 20002\n', encoding="utf-8")
-    settings = _settings(
-        monkeypatch, tmp_path, "--config", str(path), "--host", "::1", "--port", "20003"
-    )
+    settings = _settings(monkeypatch, tmp_path, config=str(path), host="::1", port=20003)
     assert (settings.host, settings.port) == ("::1", 20003)
 
 
 def test_server_table_is_accepted(monkeypatch, tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[server]\nhost = "10.0.0.2"\nport = 20004\n', encoding="utf-8")
-    settings = _settings(monkeypatch, tmp_path, "--config", str(path))
+    settings = _settings(monkeypatch, tmp_path, config=str(path))
     assert (settings.host, settings.port) == ("10.0.0.2", 20004)
 
 
 def test_env_file_comments_and_quotes(monkeypatch, tmp_path):
     path = tmp_path / "config.env"
     path.write_text('# comment\nFUNREAD_API_HOST="10.0.0.3"\n\nport=20005\n', encoding="utf-8")
-    settings = _settings(monkeypatch, tmp_path, "--config", str(path))
+    settings = _settings(monkeypatch, tmp_path, config=str(path))
     assert (settings.host, settings.port) == ("10.0.0.3", 20005)
 
 
@@ -210,33 +208,38 @@ def test_missing_default_config_is_not_an_error(monkeypatch, tmp_path):
 
 def test_missing_explicit_config_is_an_error(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="config file not found"):
-        _settings(monkeypatch, tmp_path, "--config", str(tmp_path / "absent.toml"))
+        _settings(monkeypatch, tmp_path, config=str(tmp_path / "absent.toml"))
 
 
 def test_unsupported_config_extension_is_rejected(monkeypatch, tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text("port: 1\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="unsupported config extension"):
-        _settings(monkeypatch, tmp_path, "--config", str(path))
+        _settings(monkeypatch, tmp_path, config=str(path))
 
 
 def test_malformed_config_is_rejected(monkeypatch, tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("port = = 1\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="cannot parse config file"):
-        _settings(monkeypatch, tmp_path, "--config", str(path))
+        _settings(monkeypatch, tmp_path, config=str(path))
 
 
 def test_non_numeric_port_is_rejected(monkeypatch, tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('port = "http"\n', encoding="utf-8")
     with pytest.raises(RuntimeError, match="invalid port"):
-        _settings(monkeypatch, tmp_path, "--config", str(path))
+        _settings(monkeypatch, tmp_path, config=str(path))
 
 
 # ---------------------------------------------------------------------------
 # Contract and package actions
 # ---------------------------------------------------------------------------
+
+
+def _command_names(app) -> set[str]:
+    """The names a Typer app answers to, one level down."""
+    return {info.name for info in (*app.registered_commands, *app.registered_groups)}
 
 
 def test_cli_contract_is_exposed():
@@ -251,11 +254,33 @@ def test_cli_contract_is_exposed():
         command in result.stdout for command in ("server", "upgrade", "rollback", "uninstall")
     )
     # Deliberately absent: a CLI cannot install itself before it exists. Check the
-    # subcommand list rather than the whole help text -- rollback's description
+    # registered command names rather than the help text -- rollback's description
     # legitimately contains the word "install".
-    choices = re.search(r"\{([a-z,]+)\}", result.stdout)
-    assert choices is not None, result.stdout
-    assert "install" not in choices.group(1).split(",")
+    assert "install" not in _command_names(cli.app)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (),
+        ("server",),
+        ("accounts",),
+        ("accounts", "invite"),
+        ("bogus",),
+        ("server", "bogus"),
+        ("rollback",),
+        ("server", "run", "--port", "not-a-number"),
+    ],
+)
+def test_usage_errors_exit_two(tmp_path, arguments):
+    """A group without a subcommand, an unknown name and a bad value are all usage errors.
+
+    Status 2 for these and 1 for a refusal from the service itself (see
+    ``test_start_refuses_a_second_instance_on_the_same_config``) is the contract
+    `scripts/setup.sh` execs into; it is pinned here because it is a property of
+    the CLI framework rather than of any one command.
+    """
+    assert _run_cli(tmp_path, *arguments).returncode == 2
 
 
 def test_every_server_action_takes_config(tmp_path):
