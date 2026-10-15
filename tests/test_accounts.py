@@ -40,12 +40,30 @@ def db_url(monkeypatch, tmp_path):
     ],
 )
 def test_sync_urls_are_translated_to_their_async_driver(sync_url, expected):
-    assert to_async_url(sync_url).replace("***", "p") == expected
+    assert to_async_url(sync_url) == expected
 
 
 def test_an_already_async_url_is_left_alone():
     """The resolved URL may already be async if the operator configured it that way."""
     assert to_async_url("sqlite+aiosqlite:///x.db") == "sqlite+aiosqlite:///x.db"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+psycopg2://funread:s3cret@h:5432/db",  # 翻译分支
+        "postgresql+asyncpg://funread:s3cret@h:5432/db",  # 原样放过分支
+    ],
+)
+def test_the_password_survives_translation(url):
+    """口令必须原样留在串里，不能被 `URL.__str__` 打码成 `***`。
+
+    打码过的串建出来的引擎会把 `***` 当口令送给服务端，认证失败，而驱动报的是
+    「password authentication failed」—— 指向凭据，不指向这里，于是每次都从
+    密钥库开始查。两个分支各一条：两处出口都曾经是 `str(url)`。
+    """
+    assert "s3cret" in to_async_url(url)
+    assert "***" not in to_async_url(url)
 
 
 def test_a_driverless_url_is_translated_regardless_of_sqlalchemy_version():

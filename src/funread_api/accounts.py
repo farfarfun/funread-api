@@ -145,20 +145,25 @@ def to_async_url(database_url: str) -> str:
     psycopg3，而后者本身就能异步。照它判断的话，同一个 `postgresql://` 在 2.0
     上会被映射成 asyncpg、在 2.1 上原样放过 —— 翻译结果取决于装了哪个版本。
 
+    两处出口都走 `render_as_string(hide_password=False)` 而不是 `str(url)`：
+    `URL.__str__` 自 SQLAlchemy 1.4 起把口令打码成 `***`，拿那个串去建引擎，
+    连库时送上去的口令字面量就是 `***`，认证必然失败 —— 而报错是驱动抛的
+    「password authentication failed」，看上去像凭据配错了，查不到这里。
+
     Raises:
         ValueError: 没有对应的异步驱动。宁可启动时就报出来，也不要让它在第一次
             登录时才变成一个看不懂的 500。
     """
     url = sa.engine.make_url(database_url)
     if url.drivername.partition("+")[2] in _ALREADY_ASYNC:
-        return str(url)
+        return url.render_as_string(hide_password=False)
     mapped = _ASYNC_DRIVERS.get(url.drivername)
     if mapped is None:
         raise ValueError(
             f"数据库 {url.drivername} 没有可用的异步驱动，账号功能需要它。"
             f"支持的同步前缀：{', '.join(sorted(_ASYNC_DRIVERS))}"
         )
-    return str(url.set(drivername=mapped))
+    return url.set(drivername=mapped).render_as_string(hide_password=False)
 
 
 def _tune_sqlite(dbapi_conn: Any, _record: Any) -> None:
