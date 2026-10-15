@@ -26,6 +26,9 @@ dependencies = [
     "aiomysql>=0.2.0",
     # Starlette 的 SessionMiddleware 签 cookie 用它，不是 starlette 的硬依赖。
     "itsdangerous>=2.1.0",
+    # 命令行入口（src/funread_api/cli.py）用的框架。funread 那边也会间接带进来，
+    # 但这里是直接 import，必须自己声明下界。
+    "typer>=0.12",
 ]
 license = "MIT"
 
