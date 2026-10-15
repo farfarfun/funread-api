@@ -27,8 +27,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_auth_db()
     if not auth_enabled():
         logger.warning(
-            "FUNREAD_API_PASSWORD 未配置：所有接口无鉴权开放。"
-            "若本服务不是只监听 127.0.0.1，请立即配置口令。"
+            "管理端口令未配置：所有接口无鉴权开放。"
+            "若本服务不是只监听 127.0.0.1，请立即在 config.toml 的 [auth] password "
+            "里配置口令（或写进 funsecret 的 funread/api/auth/password）。"
         )
     yield
 

@@ -16,13 +16,12 @@
 
     PYTHONPATH=src:../funread/src python scripts/export_openapi.py
 
-⚠️ 本机 funsecret 的 `funread/cache/source/db_url` 是生产 MySQL。这个脚本只建
-app、不碰数据库，但 import 链会解析配置，所以照例先 export 一个 sqlite URL。
+⚠️ 本机 funsecret 的 `funread/cache/source/db_url` 是生产 PostgreSQL。这个脚本只建
+app、不碰数据库，但 import 链会解析配置，所以照例先 override 一个 sqlite URL。
 """
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -83,8 +82,11 @@ def _referenced_schemas(node: Any, schemas: Dict[str, Any]) -> Set[str]:
 
 
 def main() -> int:
-    #  不改就会落到 funsecret 里的生产库上。只是建 app，但没必要赌。
-    os.environ.setdefault("FUNREAD_DATABASE_URL", "sqlite:////tmp/funread-openapi-export.db")
+    from funread.base import config
+
+    #  不覆盖就会落到 funsecret 里的生产库上。只是建 app，但没必要赌。
+    #  进程内 override，不设环境变量 —— 环境变量那一层已经整个不读了。
+    config.set_overrides(database_url="sqlite:////tmp/funread-openapi-export.db")
 
     from funread_api.app import create_app
 

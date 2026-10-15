@@ -6,6 +6,7 @@ import pytest
 from accounts_support import make_account
 from fastapi.testclient import TestClient
 
+from funread.base import config
 from funread.legado.engine import StaticFetcher
 from funread_api.app import create_app
 from funread_api.v1.deps import get_rss_service, reset_reader_services
@@ -64,13 +65,12 @@ def _write_source(hubs, url_id, payload):
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
+def client(tmp_path):
     """App wired to a two-source rss archive and an offline fetcher."""
     hubs = tmp_path / "hubs"
     _write_source(hubs, 1, LEGADO_SOURCE)
     _write_source(hubs, 2, WEB_VIEW_SOURCE)
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'rss.db'}")
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(hubs))
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'rss.db'}", cache_root=str(hubs))
 
     reset_reader_services()
     with TestClient(create_app()) as test_client:
@@ -104,12 +104,11 @@ def test_source_directory_lists_only_runnable_sources(client):
     assert page["items"][0]["categories"] == ["头条", "科技"]
 
 
-def test_source_directory_is_empty_before_the_first_scan(monkeypatch, tmp_path):
+def test_source_directory_is_empty_before_the_first_scan(tmp_path):
     """真实安装在首次扫描前就是空的，界面得能分辨这个状态。"""
     hubs = tmp_path / "hubs"
     _write_source(hubs, 1, LEGADO_SOURCE)
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'empty.db'}")
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(hubs))
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'empty.db'}", cache_root=str(hubs))
     reset_reader_services()
     with TestClient(create_app()) as fresh:
         assert fresh.get("/api/v1/rss/sources").json()["total"] == 0
@@ -394,10 +393,9 @@ def test_rss_needs_an_identity_once_accounts_exist(client):
     assert _subscribe_feed(client).status_code == 401
 
 
-def test_reader_public_does_not_open_the_ssrf_endpoint(client, monkeypatch):
+def test_reader_public_does_not_open_the_ssrf_endpoint(client):
     """POST /rss/subscriptions 让服务端拉任意 URL；它不随「公开阅读端」放开。"""
-    monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    monkeypatch.setenv("FUNREAD_READER_PUBLIC", "1")
+    config.set_overrides(api_password="hunter2", reader_public=True)
     make_account("alice", "password123")
 
     assert _subscribe_feed(client).status_code == 401

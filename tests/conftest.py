@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
+from funread.base import config
 from funread.legado.reader import storage
 from funread_api import accounts as accounts_module
-from funread_api import security
 from funread_api.v1.deps import (
     get_download_tracker,
     get_update_check_tracker,
@@ -13,25 +13,34 @@ from funread_api.v1.deps import (
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_secrets(monkeypatch):
-    """Cut the tests off from the machine's funsecret store.
+def _no_ambient_config(tmp_path, monkeypatch):
+    """Cut the tests off from the machine's own configuration.
 
-    funsecret is a real per-developer store -- on this machine it holds a
-    production MySQL URL -- so leaving it live would make "no password
-    configured" mean "no password configured on this laptop", and would let
-    a locally-set secret turn unrelated tests into 401s. Tests that want auth
-    on set FUNREAD_API_PASSWORD explicitly.
+    Two ambient sources would otherwise leak in:
+
+    * **funsecret** —— 真实的开发者密钥库，本机那份里是生产 PostgreSQL 地址和一个
+      真的管理端口令。留着它的话"没配口令"就变成了"这台笔记本上没配口令"，而且本机
+      设过的口令会把一堆无关用例变成 401。
+    * **config.toml** —— `~/.farfarfun/funread/config.toml` 和上一个用例注册进去的
+      那些文件。`shared_config_path()` 跟着 HOME 走，所以改 HOME 就够了；注册列表是
+      进程内的全局状态，必须显式清掉。
+
+    口令、`reader_public`、`register_open` 全部不设，让各层兜底值生效（注册默认
+    **开**，闸门是邀请码行而不是一个静态口令）。想测鉴权的用例自己
+    `config.set_overrides(api_password=...)`。
     """
-    monkeypatch.setattr(security, "_read_secret", lambda: None)
-    monkeypatch.delenv("FUNREAD_API_PASSWORD", raising=False)
-    monkeypatch.delenv("FUNREAD_READER_PUBLIC", raising=False)
-    #  Registration is open by default now that the gate is an invite-code row
-    #  rather than a static env secret; a developer's shell must not close it
-    #  (nor open it) behind the tests' back.
-    monkeypatch.delenv("FUNREAD_REGISTER_OPEN", raising=False)
-    #  A fixed session secret: the real resolver would otherwise read funsecret
-    #  or *write* a key file into the developer's ~/.config.
-    monkeypatch.setenv("FUNREAD_SESSION_SECRET", "test-session-secret")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+    #  整条 funsecret 层断掉，不是只断某一个键：这个进程里 `resolve_setting` 的每一次
+    #  调用都会走到它，一个一个 override 早晚漏一个。想测这一层的用例自己 setattr 回去。
+    monkeypatch.setattr(config, "read_secret_value", lambda **_kwargs: None)
+    config.reset_config_files()
+    #  固定一个会话签名密钥：真的解析器会去读 funsecret，或者往配置目录里**写**一个
+    #  密钥文件。
+    config.set_overrides(session_secret="test-session-secret")
+    yield
+    config.clear_overrides()
+    config.reset_config_files()
 
 
 @pytest.fixture(autouse=True)
@@ -40,15 +49,22 @@ def _isolate_database(tmp_path, monkeypatch):
 
     Belt and braces over funread's own autouse fixture: this process resolves
     the database through ``funread.base.config``, which falls back to funsecret
-    -- and on this machine that is the production MySQL. A test that forgets to
-    set the env var must not reach it.
+    -- and on this machine that is the production PostgreSQL. A test that
+    forgets to isolate must not reach it.
 
-    ``_INITIALIZED_DATABASES`` and the memoised services are keyed by URL, so
-    both are cleared: otherwise the first test's engine (and its schema
-    migration state) would be reused by every later one.
+    用**进程内 override**，不是 `monkeypatch.setenv`：`FUNREAD_*` 那一层已经整个删
+    掉了，继续 setenv 的话这个 fixture 会变成空操作，然后一路掉到生产库上。
+    `apps/funread/tests/test_config.py::test_environment_variables_are_ignored`
+    钉住了这件事。
+
+    ``_INITIALIZED_DATABASES`` and the memoised services are keyed by URL /
+    config revision, so both are cleared: otherwise the first test's engine (and
+    its schema migration state) would be reused by every later one.
     """
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'funread-test.db'}")
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(tmp_path / "hubs"))
+    config.set_overrides(
+        database_url=f"sqlite:///{tmp_path / 'funread-test.db'}",
+        cache_root=str(tmp_path / "hubs"),
+    )
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
     reset_reader_services()
     get_download_tracker().clear()

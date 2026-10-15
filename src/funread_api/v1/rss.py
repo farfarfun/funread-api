@@ -7,11 +7,12 @@ front-end sees one list either way; which parser runs is the service's business.
 **``POST /subscriptions`` with ``kind="feed"`` makes the server fetch an
 arbitrary URL -- an SSRF primitive.** It therefore sits behind
 ``require_user``, which means: never reachable unauthenticated, and never
-opened by ``FUNREAD_READER_PUBLIC`` (that flag is about *reading*). Reader
-accounts are invite-gated (``FUNREAD_REGISTER_CODE``), so "authenticated" here
-means "someone the operator let in". Private-range targets are *not* blocked:
-on a self-hosted LAN box, subscribing to another machine on the same network is
-a legitimate thing to want, and blocking it would break real use.
+opened by ``[auth] reader_public`` (that flag is about *reading*). Reader
+accounts are invite-gated (``funread-api accounts invite``), so
+"authenticated" here means "someone the operator let in". Private-range
+targets are *not* blocked: on a self-hosted LAN box, subscribing to another
+machine on the same network is a legitimate thing to want, and blocking it
+would break real use.
 """
 
 from __future__ import annotations

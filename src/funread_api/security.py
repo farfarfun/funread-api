@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import os
 import time
 from dataclasses import dataclass
 from typing import Annotated, Optional
@@ -35,6 +34,7 @@ from fastapi import Depends, HTTPException, Request, status
 from funauth.contrib.fastapi import CookieSessionStore
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funread.base import config
 from funread.legado.reader import LOCAL_USER_ID
 from funread_api.accounts import UserRole, accounts, count_users, get_session
 
@@ -81,28 +81,21 @@ LOCAL_USER = CurrentUser(user_id=LOCAL_USER_ID, username=LOCAL_USERNAME)
 # ---------------------------------------------------------------------------
 
 
-def _read_secret() -> str | None:
-    try:
-        from funsecret import read_secret
-
-        value = read_secret(cate1="funread", cate2="api", cate3="auth", cate4="password")
-    except Exception:
-        # No secret store configured is the normal case for a fresh clone or CI.
-        return None
-    return str(value) if value else None
-
-
 def resolve_api_password() -> str | None:
-    """Env ``FUNREAD_API_PASSWORD`` > funsecret ``funread/api/auth/password`` > None.
+    """管理端口令：config.toml ``[auth] password`` > funsecret > 不设（全开）。
 
-    Resolved per call rather than cached: tests monkeypatch the env, and a
-    cached ``None`` from import time would make auth untestable and would also
-    mean a password added after startup never takes effect.
+    每次调用都重新解析，不缓存：import 期缓存下来的 ``None`` 会让鉴权没法测，也会
+    让启动之后才加上的口令永远不生效。
+
+    1.1.116 起密钥库**坏掉**会原样抛，而不是当成"没配口令"。以前那个 ``except
+    Exception: return None`` 会把一个连不上的密钥库翻译成"全开"，方向正好反了。
     """
-    env_value = os.environ.get("FUNREAD_API_PASSWORD")
-    if env_value:
-        return env_value
-    return _read_secret()
+    value = config.resolve_setting(
+        "api_password",
+        candidates=(("auth", "password"), (None, "api_password")),
+        secret=("api", "auth", "password"),
+    )
+    return str(value) if value else None
 
 
 def auth_enabled() -> bool:
@@ -110,8 +103,16 @@ def auth_enabled() -> bool:
 
 
 def reader_is_public() -> bool:
-    """Whether read-only reader GETs bypass auth (``FUNREAD_READER_PUBLIC=1``)."""
-    return os.environ.get("FUNREAD_READER_PUBLIC", "").strip().lower() in {"1", "true", "yes"}
+    """只读的阅读端 GET 是否免鉴权：config.toml ``[auth] reader_public``，默认关。"""
+    return bool(
+        config.resolve_setting(
+            "reader_public",
+            candidates=(("auth", "reader_public"), (None, "reader_public")),
+            secret=("api", "auth", "reader_public"),
+            fallback=False,
+            coerce=config.as_bool,
+        )
+    )
 
 
 def _sign(password: str, expires_at: int) -> str:
@@ -174,7 +175,7 @@ async def resolve_current_user(request: Request, session: AsyncSession) -> Optio
       readable by anyone on the LAN; and
     - the admin guard is satisfied, which with no password configured means
       "trivially". So a fresh clone and CI keep working untouched, while a
-      setup that had set ``FUNREAD_API_PASSWORD`` to lock everything down does
+      setup that had set ``[auth] password`` to lock everything down does
       not silently lose that protection by upgrading into accounts.
     """
     raw = session_store.current(request)
@@ -227,7 +228,7 @@ def require_session(request: Request) -> None:
 
 
 async def require_reader(request: Request, user: OptionalUser) -> None:
-    """Read-only reader endpoints, honouring ``FUNREAD_READER_PUBLIC``.
+    """Read-only reader endpoints, honouring ``[auth] reader_public``.
 
     These are stateless: search, parse, fetch. They carry no user identity, so
     a public reader is a reasonable thing to want (share the LAN address, no
@@ -243,7 +244,7 @@ async def require_reader(request: Request, user: OptionalUser) -> None:
 async def require_user(user: OptionalUser) -> CurrentUser:
     """Per-user endpoints: shelf, progress, subscriptions.
 
-    Never opened up by ``FUNREAD_READER_PUBLIC`` -- that flag is about
+    Never opened up by ``[auth] reader_public`` -- that flag is about
     *reading*, and someone else's shelf is not public reading material.
     """
     if user is None:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from funread.base import config as shared_config
 from funread_api import cli
 
 
@@ -18,7 +20,22 @@ def _free_port() -> int:
 
 
 def _run_cli(workdir: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    environment = os.environ | {"FUNREAD_DATABASE_URL": f"sqlite:///{workdir / 'api.db'}"}
+    """跑一次真正的 CLI 子进程，库地址指到 workdir 下的一个 sqlite 文件。
+
+    这里必须给子进程一个**假 HOME 加一份共享根配置**，不能只设环境变量：子进程
+    不读任何 `FUNREAD_*`，而它启动时会 `init_*_db()` 真的建表 —— 不挡住的话落到
+    funsecret 里那个生产 PostgreSQL 上去。假 HOME 同时也让 funsecret 本身找不到
+    自己的库，是第二道闸。
+    """
+    home = workdir / "cli-home"
+    shared = home / shared_config.SHARED_CONFIG_RELATIVE
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text(
+        f'[database]\nurl = "sqlite:///{workdir / "api.db"}"\n'
+        f'[cache]\nroot = "{workdir / "hubs"}"\n',
+        encoding="utf-8",
+    )
+    environment = os.environ | {"HOME": str(home)}
     return subprocess.run(
         [sys.executable, "-m", "funread_api.cli", *arguments],
         cwd=workdir,
@@ -139,14 +156,23 @@ def _settings(monkeypatch, tmp_path, **flags) -> cli.Settings:
     # paths.legacy_state_dir() 也落在 tmp 里 —— 它按老办法算，仍然看这个变量。
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    # 注册表是进程内的全局状态：上一条用例 `use_config_file` 进去的那份文件会一直在
+    # 链上，于是这条用例读到的 host/port 可能来自别人的 tmp_path。
+    shared_config.reset_config_files()
     # ``flags`` 就是 `server run` 那几个选项解析出来的值；选项本身由 Typer 解析，
     # 端到端那部分由上面的 subprocess 用例覆盖。
     return cli._resolve_settings(**flags)
 
 
+def _write_shared(tmp_path: Path, body: str) -> Path:
+    """写一份共享根配置到 `_settings` 用的那个假 HOME 下。"""
+    path = tmp_path / "home" / shared_config.SHARED_CONFIG_RELATIVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
 def test_defaults_without_any_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("FUNREAD_API_HOST", raising=False)
-    monkeypatch.delenv("FUNREAD_API_PORT", raising=False)
     settings = _settings(monkeypatch, tmp_path)
     assert settings.host == cli.DEFAULT_HOST
     assert settings.port == cli.DEFAULT_PORT
@@ -155,11 +181,29 @@ def test_defaults_without_any_config(monkeypatch, tmp_path):
     )
 
 
-def test_environment_beats_the_hardcoded_default(monkeypatch, tmp_path):
+def test_environment_variables_are_ignored(monkeypatch, tmp_path):
+    """钉住环境变量层的删除。
+
+    这条红了说明有人把 `os.environ.get` 加回了 host/port 的解析链。不只是"多一层"：
+    整个测试套件的生产库隔离都建立在"环境变量不参与解析"之上。
+    """
     monkeypatch.setenv("FUNREAD_API_HOST", "0.0.0.0")
     monkeypatch.setenv("FUNREAD_API_PORT", "20001")
+
     settings = _settings(monkeypatch, tmp_path)
-    assert (settings.host, settings.port) == ("0.0.0.0", 20001)
+
+    assert (settings.host, settings.port) == (cli.DEFAULT_HOST, cli.DEFAULT_PORT)
+
+
+def test_a_still_set_environment_variable_is_called_out(monkeypatch, capsys):
+    """静默忽略等于静默改行为 —— 升级后那台机器的配置就凭空消失了。"""
+    monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
+
+    cli._warn_deprecated_env()
+
+    message = capsys.readouterr().err
+    assert "FUNREAD_API_PASSWORD" in message
+    assert "[auth] password" in message
 
 
 @pytest.mark.parametrize(
@@ -170,9 +214,7 @@ def test_environment_beats_the_hardcoded_default(monkeypatch, tmp_path):
         ("config.env", "FUNREAD_API_HOST=10.0.0.1\nFUNREAD_API_PORT=20002\n"),
     ],
 )
-def test_config_file_beats_the_environment(monkeypatch, tmp_path, name, body):
-    monkeypatch.setenv("FUNREAD_API_HOST", "127.0.0.9")
-    monkeypatch.setenv("FUNREAD_API_PORT", "20099")
+def test_config_file_beats_the_default(monkeypatch, tmp_path, name, body):
     path = tmp_path / name
     path.write_text(body, encoding="utf-8")
     settings = _settings(monkeypatch, tmp_path, config=str(path))
@@ -198,6 +240,26 @@ def test_env_file_comments_and_quotes(monkeypatch, tmp_path):
     path.write_text('# comment\nFUNREAD_API_HOST="10.0.0.3"\n\nport=20005\n', encoding="utf-8")
     settings = _settings(monkeypatch, tmp_path, config=str(path))
     assert (settings.host, settings.port) == ("10.0.0.3", 20005)
+
+
+def test_the_shared_root_file_is_read(monkeypatch, tmp_path):
+    """`[api]` 段写在共享根文件里就够了，不必每个服务目录再写一遍。"""
+    _write_shared(tmp_path, '[api]\nhost = "10.0.1.1"\nport = 20006\n')
+
+    settings = _settings(monkeypatch, tmp_path)
+
+    assert (settings.host, settings.port) == ("10.0.1.1", 20006)
+
+
+def test_the_service_file_beats_the_shared_root_file(monkeypatch, tmp_path):
+    _write_shared(tmp_path, '[api]\nhost = "10.0.1.1"\nport = 20006\n')
+    path = tmp_path / "config.toml"
+    path.write_text("[server]\nport = 20007\n", encoding="utf-8")
+
+    settings = _settings(monkeypatch, tmp_path, config=str(path))
+
+    #  host 服务文件里没写，仍然从共享根文件兜到。
+    assert (settings.host, settings.port) == ("10.0.1.1", 20007)
 
 
 def test_missing_default_config_is_not_an_error(monkeypatch, tmp_path):
@@ -230,6 +292,16 @@ def test_non_numeric_port_is_rejected(monkeypatch, tmp_path):
     path.write_text('port = "http"\n', encoding="utf-8")
     with pytest.raises(RuntimeError, match="invalid port"):
         _settings(monkeypatch, tmp_path, config=str(path))
+
+
+def test_a_bad_port_names_the_file_it_actually_came_from(monkeypatch, tmp_path):
+    """坏值在共享根文件里时，报错不能指着服务自己那份 —— 那份里没有这个键。"""
+    shared = _write_shared(tmp_path, '[api]\nport = "http"\n')
+    service = tmp_path / "config.toml"
+    service.write_text("", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=re.escape(str(shared))):
+        _settings(monkeypatch, tmp_path, config=str(service))
 
 
 # ---------------------------------------------------------------------------

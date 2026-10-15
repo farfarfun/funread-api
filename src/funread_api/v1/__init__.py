@@ -16,7 +16,7 @@ api_router.include_router(auth_router)
 
 #  Management endpoints always need the admin password when one is configured.
 #  POST /sources in particular fetches an arbitrary URL server-side (SSRF), so
-#  it must never be reachable via the FUNREAD_READER_PUBLIC escape hatch, and
+#  it must never be reachable via the [auth] reader_public escape hatch, and
 #  never via a mere reader account either -- reading is not administering.
 api_router.include_router(sources_router, dependencies=[Depends(require_session)])
 
@@ -25,7 +25,7 @@ api_router.include_router(sources_router, dependencies=[Depends(require_session)
 api_router.include_router(pool_router, dependencies=[Depends(require_session)])
 
 #  The reader flow is stateless (search / parse / fetch) and may be opened up
-#  read-only with FUNREAD_READER_PUBLIC=1; writes still need an identity.
+#  read-only with [auth] reader_public = true; writes still need an identity.
 api_router.include_router(reader_router, dependencies=[Depends(require_reader)])
 
 #  /shelf is per-user state throughout, so it needs a reader identity and never
@@ -36,7 +36,7 @@ api_router.include_router(shelf_router, dependencies=[Depends(require_user)])
 
 #  /rss is per-user state too, and POST /rss/subscriptions makes the server
 #  fetch a URL the caller supplies (SSRF). Same guard as /shelf: authenticated
-#  reader only, never opened by FUNREAD_READER_PUBLIC.
+#  reader only, never opened by [auth] reader_public.
 api_router.include_router(rss_router, dependencies=[Depends(require_user)])
 
 __all__ = ["api_router"]

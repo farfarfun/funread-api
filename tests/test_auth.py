@@ -24,19 +24,24 @@ from accounts_support import (
 from fastapi.testclient import TestClient
 from funauth import UserRole
 
+from funread.base import config
 from funread.legado.reader import storage
 from funread_api.app import create_app
 from funread_api.security import COOKIE_NAME, issue_token, verify_token
 
 
 @pytest.fixture
-def env(monkeypatch, tmp_path):
-    """Isolate the DB. Auth env is already neutralised by the autouse conftest fixture."""
+def settings(monkeypatch, tmp_path):
+    """Isolate the DB, and hand back a setter for the auth settings.
+
+    返回的就是 `config.set_overrides`，所以用例里写 `settings(api_password="hunter2")`
+    即可。不用 `monkeypatch.setenv`：`FUNREAD_*` 那一层整个删掉了，setenv 现在是空
+    操作。override 由 conftest 的 autouse fixture 在每条用例后清掉。
+    """
     url = f"sqlite:///{tmp_path / 'auth.db'}"
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", url)
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(tmp_path / "hubs"))
+    config.set_overrides(database_url=url, cache_root=str(tmp_path / "hubs"))
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
-    return monkeypatch
+    return config.set_overrides
 
 
 def _register(client, username="alice", password="password123", code=""):
@@ -78,7 +83,7 @@ def test_malformed_admin_tokens_are_rejected(token):
 # ------------------------------------------------------------------ 未配置口令、无账号
 
 
-def test_a_fresh_install_stays_open(env):
+def test_a_fresh_install_stays_open(settings):
     """Upgrading into accounts must not lock out the existing local setup."""
     with TestClient(create_app()) as client:
         assert client.get("/api/v1/sources").status_code == 200
@@ -92,7 +97,7 @@ def test_a_fresh_install_stays_open(env):
     assert state["auth_required"] is False
 
 
-def test_admin_login_without_a_configured_password_is_a_no_op(env):
+def test_admin_login_without_a_configured_password_is_a_no_op(settings):
     with TestClient(create_app()) as client:
         response = client.post("/api/v1/auth/admin/login", json={"password": "whatever"})
 
@@ -104,9 +109,9 @@ def test_admin_login_without_a_configured_password_is_a_no_op(env):
 # ------------------------------------------------------------------ 配置了管理口令
 
 
-def test_the_admin_password_still_locks_the_shelf_while_no_account_exists(env):
+def test_the_admin_password_still_locks_the_shelf_while_no_account_exists(settings):
     """A setup that locked everything down with one password must not lose that."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         assert client.get("/api/v1/sources").status_code == 401
@@ -114,17 +119,17 @@ def test_the_admin_password_still_locks_the_shelf_while_no_account_exists(env):
         assert client.get("/api/v1/reader/search", params={"keyword": "剑"}).status_code == 401
 
 
-def test_healthz_and_me_stay_reachable(env):
+def test_healthz_and_me_stay_reachable(settings):
     """Both are needed before a session exists -- one for probes, one to get in."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         assert client.get("/healthz").status_code == 200
         assert client.get("/api/v1/auth/me").json()["authenticated"] is False
 
 
-def test_admin_login_then_use_then_logout(env):
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+def test_admin_login_then_use_then_logout(settings):
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         wrong = client.post("/api/v1/auth/admin/login", json={"password": "wrong"})
@@ -141,9 +146,9 @@ def test_admin_login_then_use_then_logout(env):
         assert client.get("/api/v1/sources").status_code == 401
 
 
-def test_admin_cookie_is_httponly(env):
+def test_admin_cookie_is_httponly(settings):
     """It is only ever read by the server; JS access would just widen XSS."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         login = client.post("/api/v1/auth/admin/login", json={"password": "hunter2"})
@@ -151,8 +156,8 @@ def test_admin_cookie_is_httponly(env):
     assert "httponly" in login.headers["set-cookie"].lower()
 
 
-def test_a_forged_admin_cookie_does_not_get_in(env):
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+def test_a_forged_admin_cookie_does_not_get_in(settings):
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         client.cookies.set(COOKIE_NAME, issue_token("hunter3"))
@@ -162,7 +167,7 @@ def test_a_forged_admin_cookie_does_not_get_in(env):
 # ------------------------------------------------------------------ 首个账号
 
 
-def test_the_first_account_needs_no_invite_code(env):
+def test_the_first_account_needs_no_invite_code(settings):
     """There is nobody to issue one yet, so requiring one would be a deadlock."""
     with TestClient(create_app()) as client:
         body = _bootstrap(client).json()
@@ -176,9 +181,9 @@ def test_the_first_account_needs_no_invite_code(env):
         assert client.get("/api/v1/shelf").status_code == 200
 
 
-def test_bootstrapping_requires_the_admin_password_when_one_is_set(env):
+def test_bootstrapping_requires_the_admin_password_when_one_is_set(settings):
     """Otherwise a registration would walk straight through a deliberate lockdown."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
 
     with TestClient(create_app()) as client:
         refused = _register(client)
@@ -189,7 +194,7 @@ def test_bootstrapping_requires_the_admin_password_when_one_is_set(env):
         assert _register(client).status_code == 201
 
 
-def test_the_first_account_inherits_the_accountless_era_data(env):
+def test_the_first_account_inherits_the_accountless_era_data(settings):
     """The shelf built before accounts existed belongs to whoever registers first."""
     with TestClient(create_app()) as client:
         added = client.post("/api/v1/shelf", json={"name": "剑来", "author": "烽火"})
@@ -205,7 +210,7 @@ def test_the_first_account_inherits_the_accountless_era_data(env):
 # ------------------------------------------------------------------ 邀请码注册
 
 
-def test_the_second_account_needs_a_valid_invite_code(env):
+def test_the_second_account_needs_a_valid_invite_code(settings):
     with TestClient(create_app()) as client:
         _bootstrap(client)
         client.post("/api/v1/auth/logout")
@@ -222,7 +227,7 @@ def test_the_second_account_needs_a_valid_invite_code(env):
     assert created.json()["role"] == UserRole.GUEST
 
 
-def test_an_invite_code_is_spent_once(env):
+def test_an_invite_code_is_spent_once(settings):
     with TestClient(create_app()) as client:
         _bootstrap(client)
         code = issue_invite(max_uses=1)
@@ -233,7 +238,7 @@ def test_an_invite_code_is_spent_once(env):
     assert second.status_code == 400
 
 
-def test_a_username_collision_gives_the_invite_slot_back(env):
+def test_a_username_collision_gives_the_invite_slot_back(settings):
     """Someone fat-fingering a taken username must not burn the code."""
     with TestClient(create_app()) as client:
         _bootstrap(client, username="alice")
@@ -246,31 +251,31 @@ def test_a_username_collision_gives_the_invite_slot_back(env):
         assert _register(client, username="bob", code=code).status_code == 201
 
 
-def test_registration_can_be_closed_outright(env):
-    """``FUNREAD_REGISTER_OPEN=0`` shuts the door even on a live code."""
+def test_registration_can_be_closed_outright(settings):
+    """``[auth] register_open = false`` shuts the door even on a live code."""
     with TestClient(create_app()) as client:
         _bootstrap(client)
         code = issue_invite()
-        env.setenv("FUNREAD_REGISTER_OPEN", "0")
+        settings(register_open=False)
 
         refused = _register(client, username="bob", code=code)
 
     assert refused.status_code == 403
-    assert "FUNREAD_REGISTER_OPEN" in refused.json()["detail"]
+    assert "register_open" in refused.json()["detail"]
 
 
 @pytest.mark.parametrize(
     ("username", "password"),
     [("ab", "password123"), ("has space", "password123"), ("alice", "short")],
 )
-def test_bad_registration_input_is_a_400(env, username, password):
+def test_bad_registration_input_is_a_400(settings, username, password):
     with TestClient(create_app()) as client:
         response = _register(client, username=username, password=password)
 
     assert response.status_code == 400
 
 
-def test_accounts_probe_reports_a_count_not_a_user_list(env):
+def test_accounts_probe_reports_a_count_not_a_user_list(settings):
     with TestClient(create_app()) as client:
         assert client.get("/api/v1/auth/accounts").json() == {
             "users": 0,
@@ -294,7 +299,7 @@ def test_accounts_probe_reports_a_count_not_a_user_list(env):
 # ------------------------------------------------------------------ 读者登录
 
 
-def test_reader_login_then_logout(env):
+def test_reader_login_then_logout(settings):
     with TestClient(create_app()) as client:
         _bootstrap(client)
         client.post("/api/v1/auth/logout")
@@ -308,7 +313,7 @@ def test_reader_login_then_logout(env):
         assert client.get("/api/v1/shelf").status_code == 200
 
 
-def test_reader_login_failures_are_indistinguishable(env):
+def test_reader_login_failures_are_indistinguishable(settings):
     """Three different causes, one answer -- otherwise this is a username oracle."""
     make_account("alice", "password123")
     make_account("carol", "password123", UserRole.GUEST)
@@ -325,7 +330,7 @@ def test_reader_login_failures_are_indistinguishable(env):
     assert wrong_password.json() == unknown_user.json()
 
 
-def test_a_disabled_account_cannot_log_in(env):
+def test_a_disabled_account_cannot_log_in(settings):
     make_account("alice", "password123")
     set_active("alice", False)
 
@@ -337,7 +342,7 @@ def test_a_disabled_account_cannot_log_in(env):
     assert response.status_code == 401
 
 
-def test_disabling_an_account_kills_its_live_session(env):
+def test_disabling_an_account_kills_its_live_session(settings):
     """The session carries only the id, so the role and the enabled flag are
     re-read every request -- that is the whole reason it carries only the id."""
     make_account("alice", "password123")
@@ -351,7 +356,7 @@ def test_disabling_an_account_kills_its_live_session(env):
         assert client.get("/api/v1/shelf").status_code == 401
 
 
-def test_once_an_account_exists_the_local_fallback_is_gone(env):
+def test_once_an_account_exists_the_local_fallback_is_gone(settings):
     """Otherwise the first account's shelf would be readable by anyone."""
     make_account("alice", "password123")
 
@@ -360,7 +365,7 @@ def test_once_an_account_exists_the_local_fallback_is_gone(env):
         assert client.get("/api/v1/auth/me").json()["authenticated"] is False
 
 
-def test_a_forged_session_cookie_does_not_get_in(env):
+def test_a_forged_session_cookie_does_not_get_in(settings):
     """The session cookie is signed by Starlette; an unsigned one is ignored."""
     make_account("alice", "password123")
 
@@ -372,7 +377,7 @@ def test_a_forged_session_cookie_does_not_get_in(env):
 # ------------------------------------------------------------------ 旧口令透明升级
 
 
-def test_a_pre_funauth_scrypt_password_still_logs_in_and_gets_upgraded(env):
+def test_a_pre_funauth_scrypt_password_still_logs_in_and_gets_upgraded(settings):
     """Upgrading the package must not make everyone reset their password."""
     make_account("alice", "placeholder-password")
     set_password_hash("alice", legacy_scrypt_hash("password123"))
@@ -390,7 +395,7 @@ def test_a_pre_funauth_scrypt_password_still_logs_in_and_gets_upgraded(env):
     assert not read_password_hash("alice").startswith("scrypt$")
 
 
-def test_a_wrong_password_against_a_scrypt_hash_is_a_plain_401(env):
+def test_a_wrong_password_against_a_scrypt_hash_is_a_plain_401(settings):
     """Not a 500 -- funauth's bcrypt verifier never sees the legacy string."""
     make_account("alice", "placeholder-password")
     set_password_hash("alice", legacy_scrypt_hash("password123"))
@@ -404,7 +409,7 @@ def test_a_wrong_password_against_a_scrypt_hash_is_a_plain_401(env):
     assert read_password_hash("alice").startswith("scrypt$")
 
 
-def test_a_legacy_account_is_not_distinguishable_by_its_failure_message(env):
+def test_a_legacy_account_is_not_distinguishable_by_its_failure_message(settings):
     """A differently-worded 401 would confirm "this account predates funauth",
     which is one confirmation of the account existing at all."""
     make_account("alice", "placeholder-password")
@@ -426,7 +431,7 @@ def test_a_legacy_account_is_not_distinguishable_by_its_failure_message(env):
     assert legacy.json() == bcrypt.json() == unknown.json()
 
 
-def test_a_disabled_legacy_account_cannot_log_in(env):
+def test_a_disabled_legacy_account_cannot_log_in(settings):
     """`is_active` is checked before the legacy verifier, not after it."""
     make_account("alice", "placeholder-password")
     set_password_hash("alice", legacy_scrypt_hash("password123"))
@@ -445,9 +450,9 @@ def test_a_disabled_legacy_account_cannot_log_in(env):
 # ------------------------------------------------------------------ 两端互不越界
 
 
-def test_an_admin_cookie_is_not_a_reader_identity(env):
+def test_an_admin_cookie_is_not_a_reader_identity(settings):
     """Unlocking the console must not hand over someone's shelf."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
     make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
@@ -456,9 +461,9 @@ def test_an_admin_cookie_is_not_a_reader_identity(env):
         assert client.get("/api/v1/shelf").status_code == 401
 
 
-def test_a_reader_cookie_does_not_unlock_the_console(env):
+def test_a_reader_cookie_does_not_unlock_the_console(settings):
     """Reading is not administering -- POST /sources is an SSRF primitive."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
     make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
@@ -479,7 +484,7 @@ def test_a_reader_cookie_does_not_unlock_the_console(env):
 # ------------------------------------------------------------------ 跨用户隔离
 
 
-def test_shelves_do_not_leak_between_accounts(env):
+def test_shelves_do_not_leak_between_accounts(settings):
     make_account("alice", "password123")
     make_account("bob", "password123")
 
@@ -502,7 +507,7 @@ def test_shelves_do_not_leak_between_accounts(env):
         assert client.get(f"/api/v1/shelf/{book_key}/cached").status_code == 404
 
 
-def test_progress_is_per_account(env):
+def test_progress_is_per_account(settings):
     make_account("alice", "password123")
     make_account("bob", "password123")
 
@@ -518,7 +523,7 @@ def test_progress_is_per_account(env):
         assert client.get("/api/v1/shelf").json()[0]["progress"] is None
 
 
-def test_shelf_groups_are_per_account(env):
+def test_shelf_groups_are_per_account(settings):
     """分组名本身也是个人数据 —— 别人架上有「政治」这一组不该被看见。"""
     make_account("alice", "password123")
     make_account("bob", "password123")
@@ -549,7 +554,7 @@ def test_shelf_groups_are_per_account(env):
         assert client.get("/api/v1/shelf").json()[0]["group"] == "玄幻"
 
 
-def test_an_update_check_task_belongs_to_the_account_that_started_it(env):
+def test_an_update_check_task_belongs_to_the_account_that_started_it(settings):
     from funread_api.v1.deps import get_update_check_tracker
 
     alice = make_account("alice", "password123")
@@ -568,19 +573,17 @@ def test_an_update_check_task_belongs_to_the_account_that_started_it(env):
 # ------------------------------------------------------------------ 公开阅读端
 
 
-def test_reader_public_opens_read_only_gets(env):
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    env.setenv("FUNREAD_READER_PUBLIC", "1")
+def test_reader_public_opens_read_only_gets(settings):
+    settings(api_password="hunter2", reader_public=True)
 
     with TestClient(create_app()) as client:
         #  No sources scanned, so this is an empty result rather than a 401
         assert client.get("/api/v1/reader/search", params={"keyword": "剑"}).status_code == 200
 
 
-def test_reader_public_does_not_open_writes(env):
+def test_reader_public_does_not_open_writes(settings):
     """The flag is about letting people *read*, not letting them drive the box."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    env.setenv("FUNREAD_READER_PUBLIC", "1")
+    settings(api_password="hunter2", reader_public=True)
     make_account("alice", "password123")
 
     with TestClient(create_app()) as client:
@@ -589,19 +592,17 @@ def test_reader_public_does_not_open_writes(env):
         assert client.post("/api/v1/shelf", json={"name": "剑来"}).status_code == 401
 
 
-def test_reader_public_does_not_open_registration(env):
+def test_reader_public_does_not_open_registration(settings):
     """Bootstrapping is still gated on the admin password, public or not."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    env.setenv("FUNREAD_READER_PUBLIC", "1")
+    settings(api_password="hunter2", reader_public=True)
 
     with TestClient(create_app()) as client:
         assert _register(client).status_code == 403
 
 
-def test_reader_public_does_not_open_the_ssrf_endpoint(env):
+def test_reader_public_does_not_open_the_ssrf_endpoint(settings):
     """POST /sources fetches an arbitrary URL server-side; it stays locked."""
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
-    env.setenv("FUNREAD_READER_PUBLIC", "1")
+    settings(api_password="hunter2", reader_public=True)
 
     with TestClient(create_app()) as client:
         response = client.post("/api/v1/sources", json={"url": "http://169.254.169.254/meta"})
@@ -609,7 +610,7 @@ def test_reader_public_does_not_open_the_ssrf_endpoint(env):
     assert response.status_code == 401
 
 
-def test_the_database_is_not_selectable_from_the_query_string(env, tmp_path):
+def test_the_database_is_not_selectable_from_the_query_string(settings, tmp_path):
     """没有一个端点可以让调用方指定连哪个库。
 
     `get_session` 曾经写成 `get_session(database_url=None)` 并直接挂成 FastAPI
@@ -618,7 +619,7 @@ def test_the_database_is_not_selectable_from_the_query_string(env, tmp_path):
     到他自己的库上，换一张本服务认的 cookie 回来。所以这里既查契约（不许出现在
     openapi 里），也查行为（真传了也不生效）。
     """
-    env.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    settings(api_password="hunter2")
     make_account("alice", "password123")
     elsewhere = tmp_path / "elsewhere.db"
 

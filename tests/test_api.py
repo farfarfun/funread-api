@@ -1,13 +1,14 @@
 import requests
 from fastapi.testclient import TestClient
 
+from funread.base import config
 from funread.legado.manage.source.storage import upsert_source_list_record
 from funread_api.app import create_app
 
 
-def test_sources_api_filters_and_paginates(monkeypatch, tmp_path):
+def test_sources_api_filters_and_paginates(tmp_path):
     database_url = f"sqlite:///{tmp_path / 'api.db'}"
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", database_url)
+    config.set_overrides(database_url=database_url)
     for url, source_type in (
         ("https://example.com/book.json", "book"),
         ("https://example.com/rss-1.json", "rss"),
@@ -28,8 +29,8 @@ def test_sources_api_filters_and_paginates(monkeypatch, tmp_path):
     assert [item["url"] for item in page["items"]] == ["https://example.com/rss-1.json"]
 
 
-def test_healthz(monkeypatch, tmp_path):
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'health.db'}")
+def test_healthz(tmp_path):
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'health.db'}")
 
     with TestClient(create_app()) as client:
         response = client.get("/healthz")
@@ -50,7 +51,7 @@ class _SourceResponse:
 
 
 def test_source_management_flow(monkeypatch, tmp_path):
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'manage.db'}")
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'manage.db'}")
     payload = [{"bookSourceName": "测试", "bookSourceUrl": "https://books.example.com"}]
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _SourceResponse(payload))
 
@@ -88,7 +89,7 @@ def test_source_management_flow(monkeypatch, tmp_path):
 
 def test_collect_source_records_failure(monkeypatch, tmp_path):
     database_url = f"sqlite:///{tmp_path / 'failure.db'}"
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", database_url)
+    config.set_overrides(database_url=database_url)
     source = upsert_source_list_record(
         url="https://example.com/rss.json",
         source_type="rss",

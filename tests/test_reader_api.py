@@ -5,6 +5,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from funread.base import config
 from funread.legado.engine import StaticFetcher
 from funread.legado.reader import get_cached_chapter, save_cached_chapter
 from funread_api.app import create_app
@@ -42,7 +43,7 @@ PAGES = {
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
+def client(tmp_path):
     """App wired to a one-source archive and an offline fetcher."""
     hubs = tmp_path / "hubs"
     path = hubs / "book" / "source" / "0-100" / "1.json"
@@ -51,8 +52,7 @@ def client(monkeypatch, tmp_path):
         json.dumps({"url_id": 1, "status": 2, "candidate": [{"source": SOURCE}]}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'reader.db'}")
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(hubs))
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'reader.db'}", cache_root=str(hubs))
 
     reset_reader_services()
     with TestClient(create_app()) as test_client:
@@ -727,7 +727,7 @@ EXPLORE_PAGES = {
 
 
 @pytest.fixture
-def explore_client(monkeypatch, tmp_path):
+def explore_client(tmp_path):
     """归档里放一个带发现页规则的源。"""
     hubs = tmp_path / "hubs"
     path = hubs / "book" / "source" / "0-100" / "7.json"
@@ -736,8 +736,7 @@ def explore_client(monkeypatch, tmp_path):
         json.dumps({"url_id": 7, "status": 2, "candidate": [{"source": EXPLORE_SOURCE}]}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", f"sqlite:///{tmp_path / 'explore.db'}")
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(hubs))
+    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'explore.db'}", cache_root=str(hubs))
 
     reset_reader_services()
     with TestClient(create_app()) as test_client:
@@ -895,11 +894,11 @@ def test_pool_patch_rejects_an_unknown_source_type(client):
     assert client.patch("/api/v1/pool/video/1", json={"enabled": False}).status_code == 422
 
 
-def test_pool_is_admin_only(client, monkeypatch):
+def test_pool_is_admin_only(client):
     """改一个源的启停会影响所有用户的搜索结果，不该由任意读者改。"""
     from accounts_support import make_account
 
-    monkeypatch.setenv("FUNREAD_API_PASSWORD", "hunter2")
+    config.set_overrides(api_password="hunter2")
     make_account("alice", "password123")
 
     assert client.get("/api/v1/pool").status_code == 401

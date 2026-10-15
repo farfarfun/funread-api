@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterator, Optional
 
 from fastapi import HTTPException, status
 
+from funread.base import config
 from funread.legado.engine import (
     JsNotSupportedError,
     UnsupportedFeatureError,
@@ -20,30 +20,33 @@ from funread.legado.engine import (
 from funread.legado.reader import ReaderService, RssService
 
 _lock = threading.Lock()
-_services: Dict[Tuple[Optional[str], Optional[str]], ReaderService] = {}
-_rss_services: Dict[Tuple[Optional[str], Optional[str]], RssService] = {}
+#: ``(建这个实例时的 config revision, 实例)``。只留一个 —— revision 一变旧实例就
+#: 永远取不到了，留着只会把它那条数据库连接池按在内存里直到进程结束。
+_reader_slot: Optional[tuple[int, ReaderService]] = None
+_rss_slot: Optional[tuple[int, RssService]] = None
 
 
 def get_reader_service() -> ReaderService:
-    """Process-wide service, keyed by the env vars that configure it.
+    """Process-wide service, rebuilt when :func:`config.config_revision` moves.
 
-    Keyed instead of a plain singleton because the tests monkeypatch
-    ``FUNREAD_CACHE_ROOT``/``FUNREAD_DATABASE_URL`` per test, and a bare
-    singleton would leak the first test's tmp_path into every later one. In
-    production both are either unset or constant, so this is one instance.
+    Not a plain singleton because the tests override the database URL and cache
+    root per test, and a bare singleton would leak the first test's tmp_path
+    into every later one. In production the configuration is registered once at
+    startup and never moves, so this is one instance.
+
+    用 revision 判断而不是"解析出来的值"：后者每个请求都要打一次 funsecret。
+    revision 只在 override / 注册配置文件时才动，正好是配置可能变的那一刻。
 
     Sharing matters: ``SourceRegistry`` memoises parsed ``SourceSpec``s, and an
     aggregated search touches a dozen of them per request.
     """
-    key = (os.environ.get("FUNREAD_CACHE_ROOT"), os.environ.get("FUNREAD_DATABASE_URL"))
+    global _reader_slot
+    revision = config.config_revision()
     with _lock:
-        service = _services.get(key)
-        if service is None:
-            #  Passing the raw env values through (``None`` included) keeps
-            #  funread's own resolve_* fallbacks in charge.
-            service = ReaderService(cache_root=key[0], database_url=key[1])
-            _services[key] = service
-        return service
+        if _reader_slot is None or _reader_slot[0] != revision:
+            #  不传 cache_root/database_url，让 funread 自己走那条四层链。
+            _reader_slot = (revision, ReaderService())
+        return _reader_slot[1]
 
 
 def get_rss_service() -> RssService:
@@ -54,20 +57,20 @@ def get_rss_service() -> RssService:
     ``reader_source_prefs`` partition), and sharing one registry between book
     and rss would hand book specs to the RSS engine.
     """
-    key = (os.environ.get("FUNREAD_CACHE_ROOT"), os.environ.get("FUNREAD_DATABASE_URL"))
+    global _rss_slot
+    revision = config.config_revision()
     with _lock:
-        service = _rss_services.get(key)
-        if service is None:
-            service = RssService(cache_root=key[0], database_url=key[1])
-            _rss_services[key] = service
-        return service
+        if _rss_slot is None or _rss_slot[0] != revision:
+            _rss_slot = (revision, RssService())
+        return _rss_slot[1]
 
 
 def reset_reader_services() -> None:
     """Drop the cached services. Only for tests and hot config reloads."""
+    global _reader_slot, _rss_slot
     with _lock:
-        _services.clear()
-        _rss_services.clear()
+        _reader_slot = None
+        _rss_slot = None
 
 
 @dataclass

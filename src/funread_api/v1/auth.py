@@ -71,7 +71,7 @@ class SessionState(BaseModel):
     auth_required: bool
     #: Whether this request holds a valid admin session.
     admin: bool
-    #: Whether read-only reader GETs are open (``FUNREAD_READER_PUBLIC``).
+    #: Whether read-only reader GETs are open (``[auth] reader_public``).
     reader_public: bool
     #: Whether ``POST /auth/register`` would be accepted at all.
     register_open: bool
@@ -122,12 +122,12 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
     on offer: with zero accounts, ``security.resolve_current_user`` already
     hands the implicit local identity to any request that satisfies the admin
     guard. So this path is gated on *exactly that same* condition -- otherwise
-    a LAN-reachable instance with ``FUNREAD_API_PASSWORD`` set would have its
+    a LAN-reachable instance with ``[auth] password`` set would have its
     lockdown bypassed by a registration. It is deliberately **exempt** from
-    ``FUNREAD_REGISTER_OPEN``: that flag closes self-service signup by
+    ``[auth] register_open``: that flag closes self-service signup by
     strangers, while this is the operator claiming their own box with the admin
-    password. Honouring it here would make ``FUNREAD_REGISTER_OPEN=0`` a box
-    that can never have a first account at all.
+    password. Honouring it here would make ``register_open = false`` a box that
+    can never have a first account at all.
 
     **Invite code** (an account exists). Requires a code issued by
     ``funread-api accounts invite``, and produces a ``GUEST``. The four reasons
@@ -154,7 +154,7 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
         if not registration_open():
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="注册未开放：服务端设置了 FUNREAD_REGISTER_OPEN=0",
+                detail="注册未开放：服务端在 config.toml 里设了 [auth] register_open = false",
             )
         if not payload.code:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="需要邀请码")

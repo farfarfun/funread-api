@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from accounts_support import legacy_scrypt_hash
 from fastapi.testclient import TestClient
 
+from funread.base import config
 from funread.legado.manage.source.storage import _get_engine
 from funread.legado.reader import storage
 from funread_api.accounts import ReaderUser, init_auth_db, to_async_url
@@ -18,10 +19,10 @@ from funread_api.app import create_app
 
 
 @pytest.fixture
-def env(monkeypatch, tmp_path):
+def db_url(monkeypatch, tmp_path):
+    """本用例独占的库，顺手把地址还给用例 —— 这里的断言是直接读表的。"""
     url = f"sqlite:///{tmp_path / 'accounts.db'}"
-    monkeypatch.setenv("FUNREAD_DATABASE_URL", url)
-    monkeypatch.setenv("FUNREAD_CACHE_ROOT", str(tmp_path / "hubs"))
+    config.set_overrides(database_url=url, cache_root=str(tmp_path / "hubs"))
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
     return url
 
@@ -106,18 +107,18 @@ def _read_users(url):
         }
 
 
-def test_the_legacy_table_is_migrated_in_place(env):
+def test_the_legacy_table_is_migrated_in_place(db_url):
     _create_pre_funauth_user_table(
-        env,
+        db_url,
         [
             (3, "alice", legacy_scrypt_hash("password123"), 0),
             (7, "bob", legacy_scrypt_hash("password456"), 1),
         ],
     )
 
-    init_auth_db(env)
+    init_auth_db(db_url)
 
-    users = _read_users(env)
+    users = _read_users(db_url)
     #  The ids carry over untouched -- which is the whole reason the shelf and
     #  progress tables need no migration of their own.
     assert users["alice"].id == 3
@@ -131,39 +132,39 @@ def test_the_legacy_table_is_migrated_in_place(env):
     assert users["alice"].password_hash.startswith("scrypt$")
 
 
-def test_the_legacy_table_is_dropped_so_there_is_one_truth(env):
-    _create_pre_funauth_user_table(env, [(1, "alice", legacy_scrypt_hash("password123"), 0)])
+def test_the_legacy_table_is_dropped_so_there_is_one_truth(db_url):
+    _create_pre_funauth_user_table(db_url, [(1, "alice", legacy_scrypt_hash("password123"), 0)])
 
-    init_auth_db(env)
+    init_auth_db(db_url)
 
-    engine = _get_engine(env)
+    engine = _get_engine(db_url)
     assert "reader_user__pre_funauth" not in set(sa.inspect(engine).get_table_names())
 
 
-def test_migrating_twice_is_a_no_op(env):
+def test_migrating_twice_is_a_no_op(db_url):
     """A restart must not re-run it -- the second pass would find no ``user_id``."""
-    _create_pre_funauth_user_table(env, [(1, "alice", legacy_scrypt_hash("password123"), 0)])
-    init_auth_db(env)
+    _create_pre_funauth_user_table(db_url, [(1, "alice", legacy_scrypt_hash("password123"), 0)])
+    init_auth_db(db_url)
 
     import funread_api.accounts as accounts_module
 
     accounts_module._AUTH_INITIALIZED.clear()
-    init_auth_db(env)
+    init_auth_db(db_url)
 
-    assert list(_read_users(env)) == ["alice"]
+    assert list(_read_users(db_url)) == ["alice"]
 
 
-def test_a_fresh_database_just_gets_the_tables(env):
-    init_auth_db(env)
+def test_a_fresh_database_just_gets_the_tables(db_url):
+    init_auth_db(db_url)
 
-    tables = set(sa.inspect(_get_engine(env)).get_table_names())
+    tables = set(sa.inspect(_get_engine(db_url)).get_table_names())
     assert {"reader_user", "reader_invite_code"} <= tables
-    assert _read_users(env) == {}
+    assert _read_users(db_url) == {}
 
 
-def test_an_already_migrated_database_is_not_touched(env):
-    init_auth_db(env)
-    engine = _get_engine(env)
+def test_an_already_migrated_database_is_not_touched(db_url):
+    init_auth_db(db_url)
+    engine = _get_engine(db_url)
     with engine.begin() as connection:
         connection.execute(
             ReaderUser.__table__.insert().values(
@@ -180,16 +181,16 @@ def test_an_already_migrated_database_is_not_touched(env):
     import funread_api.accounts as accounts_module
 
     accounts_module._AUTH_INITIALIZED.clear()
-    init_auth_db(env)
+    init_auth_db(db_url)
 
-    assert _read_users(env)["alice"].role == "admin"
+    assert _read_users(db_url)["alice"].role == "admin"
 
 
-def test_the_whole_upgrade_path_ends_in_a_working_login(env):
+def test_the_whole_upgrade_path_ends_in_a_working_login(db_url):
     """Legacy table + legacy hash + a shelf, all the way to a logged-in request."""
-    storage.init_reader_db(env)
-    storage.upsert_shelf_book({"name": "剑来"}, user_id=3, database_url=env)
-    _create_pre_funauth_user_table(env, [(3, "alice", legacy_scrypt_hash("password123"), 0)])
+    storage.init_reader_db(db_url)
+    storage.upsert_shelf_book({"name": "剑来"}, user_id=3, database_url=db_url)
+    _create_pre_funauth_user_table(db_url, [(3, "alice", legacy_scrypt_hash("password123"), 0)])
 
     with TestClient(create_app()) as client:
         login = client.post(
@@ -201,4 +202,4 @@ def test_the_whole_upgrade_path_ends_in_a_working_login(env):
         #  The shelf was keyed by the old user_id and is still hers
         assert [book["name"] for book in client.get("/api/v1/shelf").json()] == ["剑来"]
 
-    assert not _read_users(env)["alice"].password_hash.startswith("scrypt$")
+    assert not _read_users(db_url)["alice"].password_hash.startswith("scrypt$")

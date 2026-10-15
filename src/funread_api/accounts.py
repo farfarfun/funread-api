@@ -2,7 +2,7 @@
 
 ## 为什么账号表在 funread-api 而不在 funread 核心库
 
-funauth 要求 **Python 3.12 + SQLAlchemy async**，而 `funread` 的下限是 3.10、
+funauth 要求 **Python 3.12 + SQLAlchemy async**，而 `funread` 的下限是 3.11、
 `funread.legado.reader` 整层是同步的。把 funauth 拉成 funread 的硬依赖等于替所有
 只用采集功能的人抬高 Python 下限，还要给那一层塞一个用不到的异步连接池。所以
 账号留在这个本来就要 3.12 的服务里，核心库只认 `user_id` 这个整数。
@@ -35,7 +35,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import os
 import re
 import secrets
 from pathlib import Path
@@ -53,6 +52,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
 
+from funread.base import config
 from funread.base.config import is_sqlite_url
 from funread.legado.manage.source.storage import _get_database_url, _get_engine
 from funread_api.paths import migrate_legacy_state, state_dir
@@ -421,7 +421,7 @@ def _config_dir() -> Path:
 
 
 def resolve_session_secret() -> str:
-    """env `FUNREAD_SESSION_SECRET` > funsecret > 配置目录里的一个文件。
+    """config.toml `[auth] session_secret` > funsecret > 配置目录里的一个文件。
 
     **不能用「每次启动随机生成」**（funflix 那样）：阅读端的会话有效期是一个月，
     而这个服务会因为升级、改配置、机器重启而重启好几次。每次重启都把所有人踢下线，
@@ -430,19 +430,13 @@ def resolve_session_secret() -> str:
     所以兜底这条路会把密钥**落盘一次**（0600），之后每次启动读同一份。文件在
     配置目录里而不是工作目录里 —— 工作目录可能是个临时 checkout。
     """
-    env_value = os.environ.get("FUNREAD_SESSION_SECRET")
-    if env_value:
-        return env_value
-
-    try:
-        from funsecret import read_secret
-
-        value = read_secret(cate1="funread", cate2="api", cate3="auth", cate4="session_secret")
-        if value:
-            return str(value)
-    except Exception:
-        #  没配 funsecret 是新克隆和 CI 的常态，不是错误
-        pass
+    value = config.resolve_setting(
+        "session_secret",
+        candidates=(("auth", "session_secret"), (None, "session_secret")),
+        secret=("api", "auth", "session_secret"),
+    )
+    if value:
+        return str(value)
 
     path = _config_dir() / SESSION_SECRET_FILENAME
     try:
@@ -468,19 +462,24 @@ def resolve_session_secret() -> str:
 
 
 def registration_open() -> bool:
-    """注册入口开不开。`FUNREAD_REGISTER_OPEN` 默认**开**。
+    """注册入口开不开。config.toml `[auth] register_open`，默认**开**。
 
     和旧的 `FUNREAD_REGISTER_CODE` 相反（那个默认关）。因为闸门换了：旧方案的
-    「码」是一个环境变量里的静态口令，开着就等于谁都能注册；现在要的是库里一张
-    真实存在、还有剩余次数的邀请码，**一张都没签发时注册实际上就是关着的**。
-    默认关反而会让人签发了码却注册不了，还查不出为什么。
+    「码」是一个静态口令，开着就等于谁都能注册；现在要的是库里一张真实存在、还有
+    剩余次数的邀请码，**一张都没签发时注册实际上就是关着的**。默认关反而会让人
+    签发了码却注册不了，还查不出为什么。
 
-    真要彻底封死（比如公网暴露期间）就设 `FUNREAD_REGISTER_OPEN=0`。
+    真要彻底封死（比如公网暴露期间）就在 config.toml 里写 `register_open = false`。
     """
-    value = os.environ.get("FUNREAD_REGISTER_OPEN", "").strip().lower()
-    if not value:
-        return True
-    return value in {"1", "true", "yes", "on"}
+    return bool(
+        config.resolve_setting(
+            "register_open",
+            candidates=(("auth", "register_open"), (None, "register_open")),
+            secret=("api", "auth", "register_open"),
+            fallback=True,
+            coerce=config.as_bool,
+        )
+    )
 
 
 __all__ = [

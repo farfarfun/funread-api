@@ -4,16 +4,24 @@ Settings resolution, highest priority first:
 
 1. an explicit CLI flag (``--host`` / ``--port``)
 2. the config file (``--config``, else the default path below)
-3. the ``FUNREAD_API_HOST`` / ``FUNREAD_API_PORT`` environment variables
+3. the shared root config, ``~/.farfarfun/funread/config.toml``
 4. the hardcoded loopback defaults
+
+**No ``FUNREAD_*`` environment variable is read any more** -- see the module
+docstring of ``funread.base.config`` for why, and for the single four-layer
+chain (explicit > config.toml > funsecret > fallback) every setting now shares.
+Anything that used to be an env var belongs in the config file; this CLI prints
+a loud notice for the ones it finds still set.
 
 The config file defaults to ``~/.farfarfun/funread/api/config.toml`` (see
 ``paths.py`` for why that is not under ``XDG_CONFIG_HOME``) and is parsed by
-extension (``.toml`` / ``.json`` / ``.env``). Runtime state -- the PID and log
-files -- lives *next to whichever config actually resolved*, not in a fixed
-directory and not relative to the current directory: a host running two
-instances off two configs keeps two independent sets of state, and ``stop``
-works from anywhere.
+extension (``.toml`` / ``.json`` / ``.env``). It is *registered* with
+``funread.base.config`` so sections it shares with the rest of the family --
+``[database]``, ``[cache]``, ``[auth]`` -- take priority over the shared root
+file. Runtime state -- the PID and log files -- lives *next to whichever config
+actually resolved*, not in a fixed directory and not relative to the current
+directory: a host running two instances off two configs keeps two independent
+sets of state, and ``stop`` works from anywhere.
 
 Installs predating 1.1.114 kept all of this under
 ``${XDG_CONFIG_HOME:-~/.config}/farfarfun/funread-api/``; the config file and
@@ -23,14 +31,12 @@ the session secret are moved across on first run, see
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import time
-import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -39,6 +45,7 @@ from typing import Annotated
 
 import typer
 
+from funread.base import config as shared_config
 from funread_api.paths import default_config_path, migrate_legacy_state
 
 PACKAGE_NAME = "funread-api"
@@ -48,9 +55,23 @@ DEFAULT_PORT = 18811
 STOP_TIMEOUT_SECONDS = 10
 START_TIMEOUT_SECONDS = 5
 
-#: Config keys we understand, after normalisation. A ``.env`` file naming them
-#: ``FUNREAD_API_PORT`` and a ``.toml`` file naming them ``port`` both land here.
-_KNOWN_KEYS = ("host", "port")
+#: 监听地址在配置文件里的候选位置，按先后顺序找。四种写法都认：服务自己那份
+#: config.toml 的 ``[server]`` 段、它的顶层键、共享根文件的 ``[api]`` 段，以及
+#: ``.env`` 里的 ``FUNREAD_API_HOST=``（扁平键，``funread_`` 前缀会被剥掉）。
+#: 每份文件都按这个顺序找一遍，所以服务自己那份的任何写法都盖得住共享根文件。
+_HOST_CANDIDATES = (("server", "host"), (None, "host"), ("api", "host"), (None, "api_host"))
+_PORT_CANDIDATES = (("server", "port"), (None, "port"), ("api", "port"), (None, "api_port"))
+
+#: 本服务自己那几个已废弃的环境变量 -> 现在该写哪个键。核心库那两个由
+#: ``shared_config.DEPRECATED_ENV_VARS`` 提供，启动时两张表并起来一起检查。
+_DEPRECATED_ENV_VARS = {
+    "FUNREAD_API_HOST": "config.toml 的 [server] host",
+    "FUNREAD_API_PORT": "config.toml 的 [server] port",
+    "FUNREAD_API_PASSWORD": "config.toml 的 [auth] password",
+    "FUNREAD_SESSION_SECRET": "config.toml 的 [auth] session_secret",
+    "FUNREAD_READER_PUBLIC": "config.toml 的 [auth] reader_public",
+    "FUNREAD_REGISTER_OPEN": "config.toml 的 [auth] register_open",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -83,76 +104,32 @@ def _default_config_path() -> Path:
     return default_config_path()
 
 
-def _parse_env_file(text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        if not separator:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
-
-
-def _normalise_keys(raw: dict) -> dict[str, object]:
-    """Fold ``FUNREAD_API_PORT`` / ``PORT`` / ``port`` onto the same key."""
-    normalised: dict[str, object] = {}
-    for key, value in raw.items():
-        name = str(key).strip().lower().removeprefix("funread_api_")
-        if name in _KNOWN_KEYS:
-            normalised[name] = value
-    return normalised
-
-
-def _read_config(path: Path, *, explicit: bool) -> dict[str, object]:
-    """Read and normalise a config file.
-
-    A missing file is only an error when the user named it: the *default* path
-    not existing is the normal case on a fresh install.
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        if explicit:
-            raise RuntimeError(f"config file not found: {path}") from None
-        return {}
-    except OSError as error:
-        raise RuntimeError(f"cannot read config file {path}: {error}") from None
-
-    suffix = path.suffix.lower()
-    try:
-        if suffix == ".toml":
-            raw = tomllib.loads(text)
-        elif suffix == ".json":
-            raw = json.loads(text)
-        elif suffix == ".env":
-            raw = _parse_env_file(text)
-        else:
-            raise RuntimeError(
-                f"unsupported config extension {suffix or '(none)'}: expected .toml, .json or .env"
-            )
-    except (tomllib.TOMLDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot parse config file {path}: {error}") from None
-
-    if not isinstance(raw, dict):
-        raise RuntimeError(f"config file {path} must contain a mapping at the top level")
-    # A [server] table is accepted so a shared config can grow other sections.
-    section = raw.get("server")
-    if isinstance(section, dict):
-        raw = {**raw, **section}
-    return _normalise_keys(raw)
-
-
 def _coerce_port(value: object, *, source: str) -> int:
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         raise RuntimeError(f"invalid port from {source}: {value!r}") from None
+
+
+def _register_config(config: str | None) -> Path:
+    """定下这次用哪份配置文件，并把它注册进 ``funread.base.config`` 的查找链。
+
+    注册必须发生在任何 ``resolve_*`` 之前，否则 ``[database]``、``[auth]`` 这些跨
+    进程共享的段只会从共享根文件里读到，服务自己那份 config.toml 被整个跳过。
+
+    幂等：``use_config_file`` 对重复路径是空操作，``migrate_legacy_state`` 第二次
+    返回空列表，所以同一进程里调多次没有副作用。
+    """
+    if config:
+        path = Path(config).expanduser()
+    else:
+        # 只在走默认路径时迁移：显式 --config 指的是用户自己管的文件，不该被动过。
+        # 放在读配置之前 —— 旧位置那份 config.toml 得先搬过来才读得到。
+        for name in migrate_legacy_state():
+            print(f"已从旧配置目录迁移 {name} -> {default_config_path().parent}")
+        path = _default_config_path()
+    shared_config.use_config_file(path)
+    return path
 
 
 def _resolve_settings(
@@ -161,36 +138,33 @@ def _resolve_settings(
     host: str | None = None,
     port: int | None = None,
 ) -> Settings:
-    """Fold the CLI flags, the config file, the environment and the defaults.
+    """Fold the CLI flags, the config files and the defaults.
 
     ``host`` and ``port`` are ``None`` when the flag was not given -- commands
     that have no ``--host`` flag at all (``stop`` / ``status`` / ``uninstall``)
     simply leave it out.
     """
-    if config:
-        config_path = Path(config).expanduser()
-    else:
-        # 只在走默认路径时迁移：显式 --config 指的是用户自己管的文件，不该被动过。
-        # 放在读配置之前 —— 旧位置那份 config.toml 得先搬过来才读得到。
-        for name in migrate_legacy_state():
-            print(f"已从旧配置目录迁移 {name} -> {default_config_path().parent}")
-        config_path = _default_config_path()
-    values = _read_config(config_path, explicit=config is not None)
+    config_path = _register_config(config)
+    # 文件不存在只在用户点了名的时候算错误：新装的机器上默认路径没有文件是常态。
+    if config is not None and not config_path.exists():
+        raise RuntimeError(f"config file not found: {config_path}")
 
-    resolved_host: object = host
-    if resolved_host is None:
-        resolved_host = values.get("host") or os.environ.get("FUNREAD_API_HOST") or DEFAULT_HOST
+    if host is None:
+        host = shared_config.config_value(*_HOST_CANDIDATES) or DEFAULT_HOST
 
-    if port is not None:
-        resolved_port = port
-    elif "port" in values:
-        resolved_port = _coerce_port(values["port"], source=f"config file {config_path}")
-    elif os.environ.get("FUNREAD_API_PORT"):
-        resolved_port = _coerce_port(os.environ["FUNREAD_API_PORT"], source="FUNREAD_API_PORT")
-    else:
-        resolved_port = DEFAULT_PORT
+    # `--port` 已经被 Typer 的类型标注验过了，不再过 _coerce_port —— 否则一个命令行
+    # 上的错值会被报成"配置文件里的端口不对"，指错地方。
+    if port is None:
+        port_value, origin = shared_config.config_value_with_origin(*_PORT_CANDIDATES)
+        # origin 可能是服务自己那份，也可能是共享根文件，所以报错用命中的那份而不是
+        # config_path。
+        port = (
+            DEFAULT_PORT
+            if port_value is None
+            else _coerce_port(port_value, source=f"config file {origin}")
+        )
 
-    return Settings(config_path=config_path, host=str(resolved_host), port=resolved_port)
+    return Settings(config_path=config_path, host=str(host), port=int(port))
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +684,18 @@ def invite_revoke(code: Annotated[str, typer.Argument()]) -> None:
     _dispatch(lambda: _run_account_action(run))
 
 
+def _warn_deprecated_env() -> None:
+    """机器上还设着已废弃的 ``FUNREAD_*`` 时喊一声，并说清该改到哪个键。
+
+    不喊的话升级会**静默改变行为**：这些变量从 1.1.116 起一个都不读了，设过
+    ``FUNREAD_DATABASE_URL`` 的机器会无声地掉到 funsecret 或本地 SQLite 上去。
+    走 stderr 而不是日志 —— 人是在终端上敲这个命令的。
+    """
+    table = {**shared_config.DEPRECATED_ENV_VARS, **_DEPRECATED_ENV_VARS}
+    for message in shared_config.describe_ignored_env(table):
+        print(f"warning: {message}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI over ``argv`` (``sys.argv[1:]`` when omitted) and return its exit code.
 
@@ -718,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
     ``--help`` and for a usage error, which keeps its status 2 -- so the code is
     unwrapped rather than propagated.
     """
+    _warn_deprecated_env()
     try:
         app(args=argv, prog_name=CLI_NAME)
     except SystemExit as exit_signal:
