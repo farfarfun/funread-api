@@ -19,7 +19,7 @@ dependencies = [
     # 读者账号（注册/登录/邀请码/角色）整套走 funauth。它要求 py3.12 + SQLAlchemy
     # async，这也是账号表建在本服务而不是 funread 核心库里的原因 —— 后者下限是
     # 3.11，不该为了账号功能抬高只用采集的人的 Python 下限。
-    "funauth[fastapi]>=0.2.2",
+    "funauth[fastapi]>=0.2.3",
     # funauth 是纯 async 的，而本服务其余部分同步。两个 driver 都要装：账号表走
     # async 引擎，阅读层继续走 funread 的同步引擎，同一个库两个连接。
     "aiosqlite>=0.20.0",

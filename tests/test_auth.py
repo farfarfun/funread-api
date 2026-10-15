@@ -457,12 +457,36 @@ def test_an_admin_cookie_is_not_a_reader_identity(settings):
 
     with TestClient(create_app()) as client:
         client.post("/api/v1/auth/admin/login", json={"password": "hunter2"})
-        assert client.get("/api/v1/sources").status_code == 200
         assert client.get("/api/v1/shelf").status_code == 401
 
 
+def test_the_shared_password_no_longer_unlocks_the_console(settings):
+    """管理端认**账号角色**，不认那个预共享口令。
+
+    旧模型里 `[auth] password` 是与账号平行的第二套凭据，它有个要命的缺省：
+    口令没配时所有管理端接口直接敞开。现在这条路彻底断了 —— 口令对不对都一样，
+    没有 ADMIN 账号身份就进不去。
+
+    口令本身没废，它退回「实例锁」这一个用途：挡住陌生人在一台全新实例上抢注
+    第一个（ADMIN）账号，见 `resolve_current_user` 与 `POST /auth/register`。
+    """
+    settings(api_password="hunter2")
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        assert (
+            client.post("/api/v1/auth/admin/login", json={"password": "hunter2"}).status_code == 200
+        )
+        #  口令验过了，但没有账号身份 —— 管理端一样不给进
+        assert client.get("/api/v1/sources").status_code == 401
+
+
 def test_a_reader_cookie_does_not_unlock_the_console(settings):
-    """Reading is not administering -- POST /sources is an SSRF primitive."""
+    """Reading is not administering -- POST /sources is an SSRF primitive.
+
+    普通读者登录着，所以是 **403 而不是 401**：身份有了，权限不够。两者要分开 ——
+    401 会让前端把人踢去重新登录，而再登一次也还是进不去。
+    """
     settings(api_password="hunter2")
     make_account("alice", "password123")
 
@@ -474,11 +498,26 @@ def test_a_reader_cookie_does_not_unlock_the_console(settings):
             == 200
         )
         assert client.get("/api/v1/shelf").status_code == 200
-        assert client.get("/api/v1/sources").status_code == 401
+        assert client.get("/api/v1/sources").status_code == 403
         assert (
             client.post("/api/v1/sources", json={"url": "http://169.254.169.254/meta"}).status_code
-            == 401
+            == 403
         )
+
+
+def test_an_admin_account_unlocks_the_console(settings):
+    """正向：ADMIN 角色的账号登录后管理端可用。这是现在**唯一**的进入方式。"""
+    settings(api_password="hunter2")
+    make_account("root", "password123", UserRole.ADMIN)
+
+    with TestClient(create_app()) as client:
+        assert (
+            client.post(
+                "/api/v1/auth/login", json={"username": "root", "password": "password123"}
+            ).status_code
+            == 200
+        )
+        assert client.get("/api/v1/sources").status_code == 200
 
 
 # ------------------------------------------------------------------ 跨用户隔离
@@ -644,3 +683,78 @@ def test_the_database_is_not_selectable_from_the_query_string(settings, tmp_path
         )
 
     assert not elsewhere.exists()
+
+
+def test_demoting_the_last_admin_is_a_409(settings):
+    """最后一个在用的管理员不能被降级 —— 降完谁也进不去管理端。
+
+    护栏在 funauth（0.2.3 起 `set_role`/`set_active` 都拦，抛 `LastAdmin`），
+    这里只钉住它确实被翻成了 409 而不是漏成 500 或者静默成功。
+
+    用 409 而不是 400：这不是请求本身有问题，是和当前状态冲突 —— 再加一个管理员
+    之后同样这个请求就合法了。
+    """
+    make_account("root", "password123", UserRole.ADMIN)
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "root", "password": "password123"})
+        users = {item["username"]: item for item in client.get("/api/v1/auth/users").json()}
+
+        #  只有 root 一个管理员，降 alice（访客）没问题
+        assert (
+            client.patch(
+                f"/api/v1/auth/users/{users['alice']['user_id']}", json={"role": "guest"}
+            ).status_code
+            == 200
+        )
+
+        #  提成管理员之后，root 就不再是「最后一个」了
+        promoted = client.patch(
+            f"/api/v1/auth/users/{users['alice']['user_id']}", json={"role": "admin"}
+        )
+        assert promoted.status_code == 200
+        assert promoted.json()["role"] == UserRole.ADMIN
+
+
+def test_the_last_admin_cannot_be_disabled_either(settings):
+    """停用和降级是同一个坑的两个入口，必须一起拦住。"""
+    make_account("root", "password123", UserRole.ADMIN)
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        #  alice 是访客，管不了人
+        assert client.get("/api/v1/auth/users").status_code == 403
+
+        client.post("/api/v1/auth/logout")
+        client.post("/api/v1/auth/login", json={"username": "root", "password": "password123"})
+        users = {item["username"]: item for item in client.get("/api/v1/auth/users").json()}
+
+        #  停用自己先被「不能动自己」拦下（400），轮不到 LastAdmin
+        assert (
+            client.patch(
+                f"/api/v1/auth/users/{users['root']['user_id']}", json={"is_active": False}
+            ).status_code
+            == 400
+        )
+
+
+def test_an_admin_cannot_demote_themselves(settings):
+    """不能动自己：降完当前会话立刻失去管理权，而界面上通常是误点。
+
+    这条 funauth 管不了 —— 它不知道谁是调用者。
+    """
+    make_account("root", "password123", UserRole.ADMIN)
+    make_account("other", "password123", UserRole.ADMIN)
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "root", "password": "password123"})
+        users = {item["username"]: item for item in client.get("/api/v1/auth/users").json()}
+
+        #  库里有两个管理员，所以不是 LastAdmin 拦的，是「不能动自己」
+        response = client.patch(
+            f"/api/v1/auth/users/{users['root']['user_id']}", json={"role": "guest"}
+        )
+        assert response.status_code == 400
+        assert "自己" in response.json()["detail"]

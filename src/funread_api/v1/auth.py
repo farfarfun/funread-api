@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
-from funauth import BadCredentials, InviteUnusable, UsernameTaken, UserRole
+from funauth import BadCredentials, InviteUnusable, LastAdmin, UsernameTaken, UserRole
 from pydantic import BaseModel, Field
 
 from funread.legado.reader import claim_local_data
@@ -42,6 +42,7 @@ from funread_api.security import (
     is_authenticated,
     issue_token,
     reader_is_public,
+    require_reader_admin,
     resolve_api_password,
     session_store,
 )
@@ -88,7 +89,13 @@ class SessionState(BaseModel):
 def _state(request: Request, user: CurrentUser | None) -> SessionState:
     return SessionState(
         auth_required=auth_enabled(),
-        admin=is_authenticated(request),
+        #  「当前这个身份是不是管理员」，前端据此决定放不放行 /admin。
+        #
+        #  以前这里是 `is_authenticated(request)`，也就是「那个预共享口令验过了吗」
+        #  —— 而口令没配时它恒为真，于是任何人打开页面都拿到 admin=true，管理端
+        #  整个敞开。换成角色之后它和后端 `require_reader_admin` 是同一个判据，
+        #  前端看到的和后端实际执行的不会再分叉。
+        admin=bool(user and user.is_admin),
         reader_public=reader_is_public(),
         register_open=registration_open(),
         authenticated=user is not None,
@@ -266,4 +273,104 @@ async def account_summary(session: SessionDep) -> AccountSummary:
         register_open=registration_open(),
         min_password_length=MIN_PASSWORD_LENGTH,
         bootstrap=users == 0,
+    )
+
+
+# ------------------------------------------------------------------ 人员管理
+#
+# 这一组是管理端的「人员」页：列出账号、改角色、停用启用。全部要求 ADMIN 身份
+# （`require_reader_admin`），和 /sources、/pool 同一条标准 —— 能管人显然比能管
+# 采集源更敏感。
+#
+# 注意 `/auth` 这个 router 整体**没有**全局守卫（它是登录入口，自己不能要求登录），
+# 所以这里每个端点都要单独挂。
+
+
+class UserOut(BaseModel):
+    """人员列表的一行。不含任何口令字段。"""
+
+    user_id: int
+    username: str
+    role: UserRole
+    is_active: bool
+    is_self: bool
+
+
+class UserPatch(BaseModel):
+    """改角色或改启用状态。两个都可选，只改传了的那个。"""
+
+    role: UserRole | None = None
+    is_active: bool | None = None
+
+
+@router.get("/users", response_model=list[UserOut])
+async def list_accounts(
+    session: SessionDep, actor: CurrentUser = Depends(require_reader_admin)
+) -> list[UserOut]:
+    """列出所有账号。"""
+    users = await accounts.list_users(session)
+    return [
+        UserOut(
+            user_id=int(item.id),
+            username=item.username,
+            role=item.role,
+            is_active=bool(item.is_active),
+            is_self=int(item.id) == actor.user_id,
+        )
+        for item in users
+    ]
+
+
+@router.patch("/users/{user_id}", response_model=UserOut)
+async def update_account(
+    user_id: int,
+    payload: UserPatch,
+    session: SessionDep,
+    actor: CurrentUser = Depends(require_reader_admin),
+) -> UserOut:
+    """改一个账号的角色或启用状态。
+
+    两道闸，分别由两边把守：
+
+    - **不能动自己**（这里拦）。降级或停用自己会让当前会话立刻失去管理权，而界面
+      上通常是误点。要交接就先把对方提成 ADMIN，再由对方来降你。funauth 不管这条
+      —— 它不知道谁是调用者。
+    - **不能让在用的管理员归零**（funauth 拦）。`set_role` / `set_active` 撞上会抛
+      `LastAdmin`，这里翻成 409。自己再算一遍没有意义：判定重复两份就会漂移，而
+      funauth 那份还顺带覆盖了它自己的其它入口。
+
+    走服务层而不是直接改 ORM 属性：后者绕过 funauth，以后它在角色变更上加审计或
+    缓存失效，这里就挂不上。
+    """
+    user = await accounts.get_by_id(session, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
+
+    if int(user.id) == actor.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不能修改自己的角色或状态，请让另一个管理员来操作",
+        )
+
+    username = user.username
+    try:
+        #  两步都 `commit=False`，最后一次性提交 —— 同时改角色和状态时，中间
+        #  提交会留下一个「降了级但还启用着」的瞬间状态。
+        if payload.role is not None:
+            await accounts.set_role(session, username, payload.role, commit=False)
+        if payload.is_active is not None:
+            await accounts.set_active(session, username, payload.is_active, commit=False)
+        await session.commit()
+    except LastAdmin as error:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    await session.refresh(user)
+
+    return UserOut(
+        user_id=int(user.id),
+        username=user.username,
+        role=user.role,
+        is_active=bool(user.is_active),
+        is_self=False,
     )

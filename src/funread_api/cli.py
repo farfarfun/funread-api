@@ -605,11 +605,19 @@ def accounts_set_password(username: UsernameArgument) -> None:
     _dispatch(lambda: _run_account_action(run))
 
 
-def _set_active(username: str, *, active: bool) -> None:
+def _set_active(username: str, *, active: bool, force: bool = False) -> None:
+    from funauth import LastAdmin
+
     from funread_api.accounts import accounts
 
     async def run(session) -> int:
-        if not await accounts.set_active(session, username, active):
+        try:
+            ok = await accounts.set_active(session, username, active, allow_last_admin=force)
+        except LastAdmin as error:
+            #  自 funauth 0.2.3 起，停用最后一个在用的管理员会被拦下。这里把它
+            #  翻成一行人话加一个出口，而不是让 typer 打一屏 traceback。
+            raise RuntimeError(f"{error}。确实要停用就加 --force") from error
+        if not ok:
             raise RuntimeError(f"没有这个账号：{username}")
         print(f"已{'启用' if active else '停用'} {username}")
         return 0
@@ -624,9 +632,23 @@ def accounts_enable(username: UsernameArgument) -> None:
 
 
 @accounts_app.command("disable")
-def accounts_disable(username: UsernameArgument) -> None:
-    """disable an account without deleting it"""
-    _set_active(username, active=False)
+def accounts_disable(
+    username: UsernameArgument,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="允许停用最后一个管理员（之后只能用 create-admin 重新建一个）",
+        ),
+    ] = False,
+) -> None:
+    """disable an account without deleting it
+
+    停用最后一个在用的管理员默认会被拦住 —— 那之后谁也进不了管理端。命令行是
+    唯一的后门（`accounts create-admin` 还能再建一个），所以这里留了 `--force`，
+    HTTP 那边没有。
+    """
+    _set_active(username, active=False, force=force)
 
 
 @invite_app.command("issue")
