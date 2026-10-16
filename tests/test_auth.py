@@ -758,3 +758,161 @@ def test_an_admin_cannot_demote_themselves(settings):
         )
         assert response.status_code == 400
         assert "自己" in response.json()["detail"]
+
+
+# ------------------------------------------------------------------ 设备 token
+
+
+def test_device_token_authenticates_cross_site(settings):
+    """设备 token 存在的全部理由：cookie 在跨站请求里发不出去。
+
+    套壳 / 原生客户端把页面打包进 app 之后，对用户自己服务器的请求是跨站的，
+    而会话 cookie 是 `SameSite=Lax` + `Secure=False`（局域网纯 HTTP 只能如此），
+    Lax 跨站不发、改 None 又必须配 Secure —— 死结。所以换一套凭据。
+    """
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        created = client.post("/api/v1/auth/tokens", json={"device_name": "我的手机"})
+        assert created.status_code == 201
+        token = created.json()["token"]
+        assert token
+
+    #  **新的 client，没有任何 cookie** —— 模拟 app 里的跨站请求
+    with TestClient(create_app()) as client:
+        headers = {"Authorization": f"Bearer {token}"}
+        assert client.get("/api/v1/shelf", headers=headers).status_code == 200
+        #  不带 token 就该回到未登录
+        assert client.get("/api/v1/shelf").status_code == 401
+
+
+def test_the_plaintext_token_is_returned_only_once(settings):
+    """库里只存 sha256，列表接口永远拿不到明文。"""
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        client.post("/api/v1/auth/tokens", json={"device_name": "手机"})
+
+        listed = client.get("/api/v1/auth/tokens").json()
+        assert len(listed) == 1
+        assert "token" not in listed[0]
+        assert listed[0]["device_name"] == "手机"
+
+
+def test_a_revoked_token_stops_working(settings):
+    """手机丢了要能单独吊销这一台 —— 这正是不用 JWT 的理由。"""
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        created = client.post("/api/v1/auth/tokens", json={"device_name": "旧手机"}).json()
+        token, token_id = created["token"], created["id"]
+
+        headers = {"Authorization": f"Bearer {token}"}
+        assert client.get("/api/v1/shelf", headers=headers).status_code == 200
+
+        assert client.delete(f"/api/v1/auth/tokens/{token_id}").status_code == 204
+
+    with TestClient(create_app()) as client:
+        assert (
+            client.get("/api/v1/shelf", headers={"Authorization": f"Bearer {token}"}).status_code
+            == 401
+        )
+
+
+def test_a_bearer_header_never_falls_back_to_the_cookie(settings):
+    """给了 Bearer 就不回落到 cookie，哪怕 token 是错的。
+
+    回落的话，「token 过期了为什么还能用」这类问题完全无法排查 —— 在浏览器里
+    测着一切正常，装到手机上就 401。
+    """
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        #  cookie 是好的，但 Bearer 是坏的 —— 必须 401 而不是用 cookie 放行。
+        #  token 值只能是 ASCII：HTTP 头不允许非 ASCII，写中文会在客户端就炸。
+        assert (
+            client.get(
+                "/api/v1/shelf", headers={"Authorization": "Bearer not-a-real-token"}
+            ).status_code
+            == 401
+        )
+        #  空的 Bearer 同理：客户端把变量拼错成空串时要立刻暴露
+        assert client.get("/api/v1/shelf", headers={"Authorization": "Bearer "}).status_code == 401
+        #  不带这个头才走 cookie
+        assert client.get("/api/v1/shelf").status_code == 200
+
+
+def test_tokens_are_scoped_to_their_owner(settings):
+    """只能看到和吊销自己的设备。否则知道 id 就能把别人的设备踢下线。"""
+    make_account("alice", "password123")
+    make_account("bob", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        alice_token_id = client.post("/api/v1/auth/tokens", json={}).json()["id"]
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "bob", "password": "password123"})
+        assert client.get("/api/v1/auth/tokens").json() == []
+        assert client.delete(f"/api/v1/auth/tokens/{alice_token_id}").status_code == 404
+
+
+def test_disabling_an_account_kills_all_its_devices(settings):
+    """停用账号时名下所有设备立刻失效，不用逐个吊销。"""
+    make_account("root", "password123", UserRole.ADMIN)
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        token = client.post("/api/v1/auth/tokens", json={}).json()["token"]
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "root", "password": "password123"})
+        users = {u["username"]: u for u in client.get("/api/v1/auth/users").json()}
+        assert (
+            client.patch(
+                f"/api/v1/auth/users/{users['alice']['user_id']}", json={"is_active": False}
+            ).status_code
+            == 200
+        )
+
+    with TestClient(create_app()) as client:
+        assert (
+            client.get("/api/v1/shelf", headers={"Authorization": f"Bearer {token}"}).status_code
+            == 401
+        )
+
+
+def test_cors_allows_the_shell_client_origins(settings):
+    """套壳客户端的 origin 默认就放行 —— 自托管的人不该为了装官方客户端先改配置。
+
+    这三个是**客户端自己的** origin（Capacitor 在 iOS/Android 上的固定值），
+    不是任意站点，所以写死是安全的。
+    """
+    with TestClient(create_app()) as client:
+        response = client.get("/api/v1/auth/me", headers={"Origin": "capacitor://localhost"})
+        assert response.status_code == 200
+        assert response.headers.get("access-control-allow-origin") == "capacitor://localhost"
+
+
+def test_cors_does_not_hand_out_cookies(settings):
+    """跨站一律走 Bearer，不让 cookie 参与。
+
+    开 `allow_credentials` 会把会话 cookie 暴露在跨站路径上，而我们本来就有
+    设备 token 这条更合适的路。浏览器看到没有 `allow-credentials` 就不会带
+    cookie 过来，这正是想要的。
+    """
+    with TestClient(create_app()) as client:
+        response = client.get("/api/v1/auth/me", headers={"Origin": "capacitor://localhost"})
+        assert "access-control-allow-credentials" not in response.headers
+
+
+def test_cors_rejects_an_unknown_origin(settings):
+    """没在名单里的站点拿不到放行头。"""
+    with TestClient(create_app()) as client:
+        response = client.get("/api/v1/auth/me", headers={"Origin": "https://evil.example"})
+        assert response.headers.get("access-control-allow-origin") != "https://evil.example"

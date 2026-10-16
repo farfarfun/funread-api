@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hmac
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from funauth import BadCredentials, InviteUnusable, LastAdmin, UsernameTaken, UserRole
@@ -25,9 +26,12 @@ from pydantic import BaseModel, Field
 from funread.legado.reader import claim_local_data
 from funread_api.accounts import (
     MIN_PASSWORD_LENGTH,
+    ReaderDeviceToken,
     accounts,
     count_users,
+    hash_device_token,
     is_legacy_hash,
+    new_device_token,
     registration_open,
     validate_credentials,
     verify_legacy_password,
@@ -43,6 +47,7 @@ from funread_api.security import (
     issue_token,
     reader_is_public,
     require_reader_admin,
+    require_user,
     resolve_api_password,
     session_store,
 )
@@ -374,3 +379,91 @@ async def update_account(
         is_active=bool(user.is_active),
         is_self=False,
     )
+
+
+# ------------------------------------------------------------------ 设备 token
+#
+# 给套壳 / 原生客户端用的长期凭据。为什么需要它、为什么不是 JWT、为什么是
+# sha256 而不是 bcrypt，都写在 `accounts.ReaderDeviceToken` 的 docstring 里。
+#
+# 这组端点**只认 cookie 会话**（require_user 在客户端是 Web 登录态），因为
+# 签发 token 的那一刻用户必然是在浏览器里登录着的。
+
+
+class DeviceTokenOut(BaseModel):
+    """列表里的一行。**不含 token 本身** —— 明文只在创建时给一次。"""
+
+    id: int
+    device_name: str
+    created_at: str
+    last_seen_at: str
+
+
+class DeviceTokenCreated(DeviceTokenOut):
+    #: 明文 token，**只在这里出现这一次**。库里只存 sha256，丢了只能重新签发。
+    token: str
+
+
+class DeviceTokenIn(BaseModel):
+    device_name: str = Field(default="", max_length=128)
+
+
+def _token_out(row: ReaderDeviceToken) -> DeviceTokenOut:
+    return DeviceTokenOut(
+        id=int(row.id),
+        device_name=row.device_name or "",
+        created_at=row.created_at.isoformat() if row.created_at else "",
+        last_seen_at=row.last_seen_at.isoformat() if row.last_seen_at else "",
+    )
+
+
+@router.post("/tokens", response_model=DeviceTokenCreated, status_code=status.HTTP_201_CREATED)
+async def create_device_token(
+    payload: DeviceTokenIn,
+    session: SessionDep,
+    user: CurrentUser = Depends(require_user),
+) -> DeviceTokenCreated:
+    """签发一个设备 token。明文只返回这一次。"""
+    raw = new_device_token()
+    row = ReaderDeviceToken(
+        token_hash=hash_device_token(raw),
+        user_id=user.user_id,
+        device_name=payload.device_name.strip(),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return DeviceTokenCreated(**_token_out(row).model_dump(), token=raw)
+
+
+@router.get("/tokens", response_model=list[DeviceTokenOut])
+async def list_device_tokens(
+    session: SessionDep, user: CurrentUser = Depends(require_user)
+) -> list[DeviceTokenOut]:
+    """列出自己名下的设备。只看得到自己的 —— 这不是管理端功能。"""
+    rows = await session.scalars(
+        sa.select(ReaderDeviceToken)
+        .where(ReaderDeviceToken.user_id == user.user_id)
+        .order_by(ReaderDeviceToken.id)
+    )
+    return [_token_out(row) for row in rows]
+
+
+@router.delete("/tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def revoke_device_token(
+    token_id: int, session: SessionDep, user: CurrentUser = Depends(require_user)
+) -> None:
+    """吊销一台设备。手机丢了就用这个。
+
+    按 `(id, user_id)` 删而不是只按 id：否则知道别人 token 的 id 就能把它删掉。
+    """
+    row = await session.scalar(
+        sa.select(ReaderDeviceToken).where(
+            ReaderDeviceToken.id == token_id,
+            ReaderDeviceToken.user_id == user.user_id,
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这个设备")
+    await session.delete(row)
+    await session.commit()

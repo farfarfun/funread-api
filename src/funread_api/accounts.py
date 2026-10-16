@@ -37,6 +37,7 @@ import hmac
 import logging
 import re
 import secrets
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
@@ -82,6 +83,54 @@ class ReaderUser(UserMixin, TimestampMixin, AuthBase):
 
     #: 覆盖 `UserMixin` 的 UUID 主键，理由见模块 docstring。
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+
+
+class ReaderDeviceToken(TimestampMixin, AuthBase):
+    """一台设备的长期凭据，给原生 / 套壳客户端用。
+
+    ## 为什么不是 cookie
+
+    会话 cookie 是 `SameSite=Lax` 且 `Secure=False`（局域网纯 HTTP 下只能如此）。
+    客户端把页面打包进 app 之后，请求用户自己的服务器属于**跨站**，Lax 的 cookie
+    根本不会发出去；而改成 `SameSite=None` 又必须配 `Secure`，局域网 HTTP 做不到。
+    这个死结只能换一套凭据来解。
+
+    ## 为什么不是 JWT
+
+    手机丢了要能**单独吊销这一台**。JWT 做不到，除非再建一张黑名单表 —— 那还不如
+    一开始就查表。代价是每个请求多一次索引查询，对这个量级无所谓。
+
+    ## 为什么用 sha256 而不是 bcrypt
+
+    口令用 bcrypt 是为了扛字典攻击：人选的口令熵很低。而这里的 token 是
+    `secrets.token_urlsafe(32)`，256 位随机，没有字典可查，慢哈希只是白白给
+    **每个请求**加几十毫秒。存哈希的意义在于「库被看一眼不等于所有设备被接管」，
+    sha256 足够。
+    """
+
+    __tablename__ = "reader_device_token"
+    __table_args__ = (
+        sa.UniqueConstraint("token_hash", name="uq_reader_device_token_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    #: `sha256(明文)` 的十六进制。明文只在创建时返回一次，之后无从找回。
+    token_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(sa.Integer, nullable=False, index=True)
+    #: 「牛哥的 iPhone」。用户要能在列表里认出该吊销哪一个。
+    device_name: Mapped[str] = mapped_column(sa.String(128), nullable=False, default="")
+    #: 最近一次用它请求的时间。用来认出「这台设备很久没用了，可以收掉」。
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(sa.DateTime, nullable=True)
+
+
+def hash_device_token(raw: str) -> str:
+    """明文 token -> 存库的哈希。见 `ReaderDeviceToken` 里为什么是 sha256。"""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def new_device_token() -> str:
+    """生成一个新的明文 token。32 字节 = 256 位熵。"""
+    return secrets.token_urlsafe(32)
 
 
 class ReaderInviteCode(InviteCodeMixin, TimestampMixin, AuthBase):

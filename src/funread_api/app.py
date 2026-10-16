@@ -7,12 +7,13 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from funread.legado.manage.source.storage import init_source_db
 from funread.legado.reader import init_reader_db
 from funread_api.accounts import init_auth_db, resolve_session_secret
-from funread_api.security import SESSION_TTL, auth_enabled
+from funread_api.security import SESSION_TTL, auth_enabled, resolve_cors_origins
 from funread_api.v1 import api_router
 
 logger = logging.getLogger("funread_api")
@@ -53,6 +54,22 @@ def create_app() -> FastAPI:
         #  Plain http on a LAN IP -- a secure cookie would never come back.
         https_only=False,
     )
+    #  跨站来源。Web 前端是同源反代 `/api`，用不着 CORS；需要它的是**套壳和
+    #  原生客户端** —— 它们把页面打包在 app 里，请求用户自己的服务器属于跨站。
+    #
+    #  `allow_credentials=False` 是故意的：跨站一律走 `Authorization: Bearer`，
+    #  不让 cookie 参与。开了 credentials 既要求 origin 不能是通配，又会把会话
+    #  cookie 暴露在跨站路径上，而我们本来就有设备 token 这条更合适的路。
+    origins = resolve_cors_origins()
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
     app.include_router(api_router, prefix="/api/v1")
 
     @app.get("/healthz", tags=["ops"])

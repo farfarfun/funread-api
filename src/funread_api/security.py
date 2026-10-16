@@ -30,13 +30,22 @@ import time
 from dataclasses import dataclass
 from typing import Annotated, Optional
 
+import sqlalchemy as sa
 from fastapi import Depends, HTTPException, Request, status
 from funauth.contrib.fastapi import CookieSessionStore
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funread.base import config
 from funread.legado.reader import LOCAL_USER_ID
-from funread_api.accounts import UserRole, accounts, count_users, get_session
+from funread.legado.reader.storage import utcnow
+from funread_api.accounts import (
+    ReaderDeviceToken,
+    UserRole,
+    accounts,
+    count_users,
+    get_session,
+    hash_device_token,
+)
 
 #: Admin console cookie. Pre-shared password, no user record.
 COOKIE_NAME = "funread_session"
@@ -80,6 +89,37 @@ class CurrentUser:
 #: 这个角色是管理端在新 clone 与 CI 上开箱即用的唯一依靠：管理端改按角色鉴权之后，
 #: 留着默认的 GUEST 会让一个全新实例连自己的采集台都进不去。
 LOCAL_USER = CurrentUser(user_id=LOCAL_USER_ID, username=LOCAL_USERNAME, role=UserRole.ADMIN)
+
+
+#: 套壳客户端的固定来源。Capacitor 在 iOS 上是 `capacitor://localhost`，
+#: Android 上是 `http://localhost`，旧版 Ionic 还会用 `ionic://localhost`。
+#: 这三个是**客户端自己的** origin，不是用户服务器的地址，所以可以写死。
+DEFAULT_CORS_ORIGINS = (
+    "capacitor://localhost",
+    "ionic://localhost",
+    "http://localhost",
+)
+
+
+def resolve_cors_origins() -> list[str]:
+    """允许跨站访问的来源：config.toml ``[auth] cors_origins`` > 套壳默认值。
+
+    默认就带上套壳客户端的三个 origin —— 自托管的人不该为了装一个官方客户端
+    还得先去改配置文件，而这三个来源是固定的、不是任意站点。
+
+    写成空列表（``cors_origins = []``）可以彻底关掉 CORS 中间件：只用 Web 端
+    的部署不需要它，少一层是一层。
+    """
+    configured = config.resolve_setting(
+        "cors_origins",
+        candidates=(("auth", "cors_origins"), (None, "cors_origins")),
+    )
+    if configured is None:
+        return list(DEFAULT_CORS_ORIGINS)
+    if isinstance(configured, str):
+        #  config.toml 里写成逗号分隔的字符串也认 —— funsecret 那层只能给字符串
+        return [item.strip() for item in configured.split(",") if item.strip()]
+    return [str(item).strip() for item in configured if str(item).strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +206,42 @@ def is_authenticated(request: Request) -> bool:
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
+def _bearer_token(request: Request) -> Optional[str]:
+    """从 `Authorization: Bearer xxx` 里取 token。没有这个头返回 `None`。
+
+    注意「头在但值为空」要当成**给了一个空 token**（返回空串）而不是没给 ——
+    否则客户端把变量拼错成空串时会静默回落到 cookie，在本地测着是好的、装到
+    手机上就 401。
+    """
+    header = request.headers.get("authorization") or ""
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return value.strip()
+
+
+async def _user_from_device_token(session: AsyncSession, raw: str) -> Optional[CurrentUser]:
+    """校验设备 token，顺带刷新 `last_seen_at`。"""
+    if not raw:
+        return None
+    row = await session.scalar(
+        sa.select(ReaderDeviceToken).where(ReaderDeviceToken.token_hash == hash_device_token(raw))
+    )
+    if row is None:
+        return None
+    user = await accounts.get_by_id(session, int(row.user_id))
+    if user is None or not user.is_active:
+        #  账号被停用时，它名下所有设备立刻失效 —— 不用逐个吊销 token
+        return None
+    #  `last_seen_at` 只是给人看「这台设备还在不在用」，不值得为它每个请求都写
+    #  一次库。隔一小时以上才更新。
+    now = utcnow()
+    if row.last_seen_at is None or (now - row.last_seen_at).total_seconds() > 3600:
+        row.last_seen_at = now
+        await session.commit()
+    return CurrentUser(user_id=int(user.id), username=user.username, role=user.role)
+
+
 async def resolve_current_user(request: Request, session: AsyncSession) -> Optional[CurrentUser]:
     """Who this request is acting as on the reader side, if anyone.
 
@@ -184,6 +260,15 @@ async def resolve_current_user(request: Request, session: AsyncSession) -> Optio
       setup that had set ``[auth] password`` to lock everything down does
       not silently lose that protection by upgrading into accounts.
     """
+    #  Bearer 优先于 cookie：套壳 / 原生客户端把页面打包进 app 之后，对用户
+    #  自己服务器的请求是跨站的，`SameSite=Lax` 的 cookie 发不出去。
+    #
+    #  给了 Bearer 就**不回落到 cookie**：两套凭据同时在场时静默用另一套，会让
+    #  「token 过期了为什么还能用」这类问题完全无法排查。
+    bearer = _bearer_token(request)
+    if bearer is not None:
+        return await _user_from_device_token(session, bearer)
+
     raw = session_store.current(request)
     if raw:
         try:
@@ -290,6 +375,7 @@ __all__ = [
     "require_session",
     "require_user",
     "resolve_api_password",
+    "resolve_cors_origins",
     "resolve_current_user",
     "session_store",
     "verify_token",
