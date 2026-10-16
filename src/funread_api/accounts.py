@@ -109,9 +109,7 @@ class ReaderDeviceToken(TimestampMixin, AuthBase):
     """
 
     __tablename__ = "reader_device_token"
-    __table_args__ = (
-        sa.UniqueConstraint("token_hash", name="uq_reader_device_token_hash"),
-    )
+    __table_args__ = (sa.UniqueConstraint("token_hash", name="uq_reader_device_token_hash"),)
 
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
     #: `sha256(明文)` 的十六进制。明文只在创建时返回一次，之后无从找回。
