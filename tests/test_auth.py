@@ -916,3 +916,65 @@ def test_cors_rejects_an_unknown_origin(settings):
     with TestClient(create_app()) as client:
         response = client.get("/api/v1/auth/me", headers={"Origin": "https://evil.example"})
         assert response.headers.get("access-control-allow-origin") != "https://evil.example"
+
+
+def test_a_token_can_be_issued_with_credentials_alone(settings):
+    """打包版客户端必须能在**没有会话**的情况下拿到 token。
+
+    `POST /auth/tokens` 要求 require_user，而那依赖 cookie —— 可打包版正是因为
+    跨站拿不到 cookie 才需要 token。登录的 Set-Cookie 在 allow_credentials=False
+    下不会被保存，下一步签发就是 401。这条端点是为了断开那个死循环。
+    """
+    make_account("alice", "password123")
+
+    #  全新 client，不登录，直接换 token
+    with TestClient(create_app()) as client:
+        created = client.post(
+            "/api/v1/auth/tokens/issue",
+            json={"username": "alice", "password": "password123", "device_name": "手机"},
+        )
+        assert created.status_code == 201
+        token = created.json()["token"]
+
+    #  换来的 token 可用
+    with TestClient(create_app()) as client:
+        assert (
+            client.get("/api/v1/shelf", headers={"Authorization": f"Bearer {token}"}).status_code
+            == 200
+        )
+
+
+def test_issuing_with_a_wrong_password_is_a_401(settings):
+    """失败一律同一个 401，不区分「账号不存在」和「口令错」—— 区分了就是一次
+    账号存在性确认。"""
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        wrong = client.post(
+            "/api/v1/auth/tokens/issue",
+            json={"username": "alice", "password": "nope-wrong"},
+        )
+        missing = client.post(
+            "/api/v1/auth/tokens/issue",
+            json={"username": "nobody", "password": "password123"},
+        )
+        assert wrong.status_code == 401
+        assert missing.status_code == 401
+        #  措辞也要一样
+        assert wrong.json()["detail"] == missing.json()["detail"]
+
+
+def test_an_issued_token_shows_up_in_the_owners_device_list(settings):
+    """口令换来的 token 和会话签发的是同一种东西，能在设备列表里看到并吊销。"""
+    make_account("alice", "password123")
+
+    with TestClient(create_app()) as client:
+        client.post(
+            "/api/v1/auth/tokens/issue",
+            json={"username": "alice", "password": "password123", "device_name": "平板"},
+        )
+
+    with TestClient(create_app()) as client:
+        client.post("/api/v1/auth/login", json={"username": "alice", "password": "password123"})
+        listed = client.get("/api/v1/auth/tokens").json()
+        assert [row["device_name"] for row in listed] == ["平板"]

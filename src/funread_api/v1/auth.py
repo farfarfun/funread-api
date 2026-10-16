@@ -408,6 +408,13 @@ class DeviceTokenIn(BaseModel):
     device_name: str = Field(default="", max_length=128)
 
 
+class DeviceTokenIssueIn(DeviceTokenIn):
+    """用账号口令直接换 token 的入参。"""
+
+    username: str
+    password: str
+
+
 def _token_out(row: ReaderDeviceToken) -> DeviceTokenOut:
     return DeviceTokenOut(
         id=int(row.id),
@@ -428,6 +435,50 @@ async def create_device_token(
     row = ReaderDeviceToken(
         token_hash=hash_device_token(raw),
         user_id=user.user_id,
+        device_name=payload.device_name.strip(),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return DeviceTokenCreated(**_token_out(row).model_dump(), token=raw)
+
+
+@router.post(
+    "/tokens/issue",
+    response_model=DeviceTokenCreated,
+    status_code=status.HTTP_201_CREATED,
+)
+async def issue_device_token(
+    payload: DeviceTokenIssueIn, session: SessionDep
+) -> DeviceTokenCreated:
+    """用账号口令直接换一个设备 token，**不需要先建立会话**。
+
+    `POST /auth/tokens` 要求 `require_user`，而那依赖会话 cookie —— 可打包版
+    客户端正是因为跨站拿不到 cookie 才需要 token，于是那条路对它是死的：登录
+    的 `Set-Cookie` 在 `allow_credentials=False` 下根本不会被保存，下一步签发
+    就是 401。
+
+    所以这里直接收口令换 token（等价于 OAuth 的 password grant）。安全性不低于
+    登录本身：能拿到口令的人本来就能登录，而换来的 token 可以单独吊销、还留下
+    一条「哪台设备、什么时候」的记录。
+
+    口令校验直接委托 funauth，失败一律同一个 401 —— 和 `/auth/login` 一致，
+    不区分「账号不存在」和「口令错」，否则就是一次账号存在性确认。
+
+    **不处理 scrypt 老账号**：那条升级路径在 `/auth/login` 里，走一次浏览器登录
+    就换成 bcrypt 了。在这里再抄一遍逻辑，等于把同一件事的两个实现放在两处。
+    """
+    try:
+        user = await accounts.authenticate(
+            session, (payload.username or "").strip(), payload.password
+        )
+    except BadCredentials as error:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error)) from error
+
+    raw = new_device_token()
+    row = ReaderDeviceToken(
+        token_hash=hash_device_token(raw),
+        user_id=int(user.id),
         device_name=payload.device_name.strip(),
     )
     session.add(row)
