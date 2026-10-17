@@ -13,6 +13,26 @@ from funread_api.v1.deps import (
 
 
 @pytest.fixture(autouse=True)
+def _no_colour_in_cli_output(monkeypatch):
+    """关掉 rich 的彩色渲染，让断言 CLI 输出的用例在哪儿跑都一样。
+
+    Typer 的 help 由 rich 渲染，而**上色会把选项名切成两段**：`--config` 实际写
+    出来的是 ``ESC[1;36m-`` + ``-config`` + ``ESC[0m``，两截之间夹着转义序列。
+    于是 ``"--config" in result.stdout`` 直接为假 —— 字符串确实不在里面。
+
+    这件事只在终端被判定为支持颜色时发生。本地 pytest 下子进程的 stdout 是管道，
+    rich 认定非 TTY、不上色，所以一直是绿的；**GitHub Actions 上 rich 会认为可以
+    上色**，于是 `test_every_server_action_takes_config` 成了第一条
+    「本地绿、CI 红」的用例（2026-10-17 这个仓库刚加上 CI 就撞上了）。
+
+    设在 conftest 而不是各个用例里：三处跑 CLI 的地方（``_run_cli`` 和两个裸
+    ``subprocess.run``）都继承父进程的环境变量，一处设置全部覆盖，以后新加的也
+    自动带上。``NO_COLOR`` 是跨工具的事实标准（no-color.org），rich 认它。
+    """
+    monkeypatch.setenv("NO_COLOR", "1")
+
+
+@pytest.fixture(autouse=True)
 def _no_ambient_config(tmp_path, monkeypatch):
     """Cut the tests off from the machine's own configuration.
 

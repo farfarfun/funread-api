@@ -12,6 +12,27 @@ import pytest
 from funread.base import config as shared_config
 from funread_api import cli
 
+#: ANSI SGR 转义序列（`ESC[...m`）。只认颜色/样式这一类就够 —— rich 渲染 help
+#: 时不会往里写光标移动之类的东西。
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """剥掉 ANSI 转义，拿到人眼看到的那串字。
+
+    断言 CLI 的 help 文本必须先过这一道，**因为上色会把一个选项名切成两段**：
+    `--config` 实际写出来的是 ``ESC[1;36m-`` + ``-config`` + ``ESC[0m``，两截
+    中间夹着转义序列，于是 ``"--config" in stdout`` 为假 —— 那个字符串确实不在
+    里面。
+
+    只靠环境变量关色是不够的：`NO_COLOR` 压不过 `FORCE_COLOR`（conftest 里设了
+    前者，但那只是让输出干净些，不是这里的保障）。而且这件事的触发条件是「终端
+    被判定为支持颜色」—— 本地 pytest 下子进程的 stdout 是管道，rich 认定非 TTY
+    不上色，所以一直绿；GitHub Actions 上它会上色。2026-10-17 这个仓库刚接上 CI，
+    `test_every_server_action_takes_config` 就是这么红的，而代码一个字没改过。
+    """
+    return _ANSI.sub("", text)
+
 
 def _free_port() -> int:
     with socket.socket() as sock:
@@ -322,8 +343,11 @@ def test_cli_contract_is_exposed():
         check=False,
     )
     assert result.returncode == 0
+    #  同样过 plain()：这几个名字眼下碰巧是不带连字符的单词，上色切不断它们，
+    #  但那是运气 —— 哪天多一个 `check-db` 之类的就和 --config 一个下场。
     assert all(
-        command in result.stdout for command in ("server", "upgrade", "rollback", "uninstall")
+        command in plain(result.stdout)
+        for command in ("server", "upgrade", "rollback", "uninstall")
     )
     # Deliberately absent: a CLI cannot install itself before it exists. Check the
     # registered command names rather than the help text -- rollback's description
@@ -364,7 +388,7 @@ def test_every_server_action_takes_config(tmp_path):
             check=False,
         )
         assert result.returncode == 0, action
-        assert "--config" in result.stdout, action
+        assert "--config" in plain(result.stdout), action
 
 
 def test_package_actions_use_uv_tools(monkeypatch, tmp_path):
