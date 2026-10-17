@@ -1,0 +1,50 @@
+name: ci
+
+#  这个仓库在 2026-10-17 之前**没有任何 CI** —— 223 个测试只在本地跑，而
+#  `funbuild build` 直接从本机推 PyPI。理由和对策同 funread 那边的 ci.yml：
+#  这条流水线拦不住一个已经发出去的坏版本，它只负责让问题在 push 后几分钟内
+#  可见。
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 装依赖
+        #  **显式钉 3.12**，不靠 uv 自己挑：requires-python 是 >=3.12，不指定的话
+        #  uv 会选机器上最新的满足版本（本地试的时候它挑了 3.13），于是「声明的
+        #  下限」从来没被跑过，而 runner 镜像换一次默认 Python，测的版本就悄悄
+        #  变了。这里不跑矩阵是因为只有一个下限要守，要加 3.13 以后再说。
+        #
+        #  **装的是 PyPI 上的 funread，不是隔壁目录的源码。** 这是有意的：
+        #  funread-api 声明的是 `funread[reader]>=1.1.127`，CI 验的就该是「照着
+        #  这个声明装出来的组合能不能跑」。代价是核心库里还没发版的改动在这儿
+        #  看不到 —— 那种跨仓库的联调本来也只有 monorepo 的工作区能覆盖
+        #  （本地 PYTHONPATH=src:../funread/src）。
+        run: uv sync --extra dev --python 3.12
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: 格式
+        run: uv run ruff format --check .
+
+      - name: pytest
+        #  全部离线。conftest.py 的 autouse fixture 除了把库换成临时 SQLite，
+        #  还把整个 funsecret 层打成 None —— 本机那份配置指向生产 PostgreSQL。
+        run: uv run pytest -q
