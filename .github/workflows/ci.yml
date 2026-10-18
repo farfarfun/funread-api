@@ -47,4 +47,6 @@ jobs:
       - name: pytest
         #  全部离线。conftest.py 的 autouse fixture 除了把库换成临时 SQLite，
         #  还把整个 funsecret 层打成 None —— 本机那份配置指向生产 PostgreSQL。
-        run: uv run pytest -q
+        #  --fail-on-skip：少装一个 extra 对应的用例会 skip 而不是报错，绿得毫无
+        #  意义 —— 这里把 skip 当失败。实现在 tests/conftest.py。
+        run: uv run pytest -q --fail-on-skip
