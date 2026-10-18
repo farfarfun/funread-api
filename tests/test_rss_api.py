@@ -514,3 +514,22 @@ def test_export_opml_round_trips_feed_subscriptions_only(client):
     assert body["count"] == 1
     assert 'xmlUrl="https://blog.example.com/feed.xml"' in body["opml"]
     assert "feed.example.com" not in body["opml"]
+
+
+# ---------------------------------------------------------------- 阅读历史
+
+
+def test_history_is_the_read_articles_newest_first(client):
+    sub_id = _subscribe_feed(client).json()["sub_id"]
+    items = client.get("/api/v1/rss/articles", params={"sub_id": sub_id}).json()["items"]
+    for item in items[:2]:
+        client.put(
+            f"/api/v1/rss/subscriptions/{sub_id}/articles/{item['article_key']}/read",
+            json={"read": True, "title": item["title"], "link": item["link"]},
+        )
+    history = client.get("/api/v1/rss/history").json()
+    assert [h["title"] for h in history] == [items[1]["title"], items[0]["title"]]
+    assert (
+        client.get("/api/v1/rss/history", params={"limit": 1}).json()[0]["title"]
+        == items[1]["title"]
+    )

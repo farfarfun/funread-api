@@ -172,6 +172,18 @@ class ReadAllOut(BaseModel):
     changed: int
 
 
+class HistoryOut(BaseModel):
+    sub_id: str
+    article_key: str
+    title: str
+    link: str
+    pub_date: str
+    image: str
+    #: When it was last marked read (ISO 8601) -- the list is ordered by this.
+    read_at: str
+    favorited: bool
+
+
 class FavoriteOut(BaseModel):
     sub_id: str
     article_key: str
@@ -461,6 +473,16 @@ def mark_favorite(
     service.mark_favorite(
         sub_id, user.user_id, article_key, favorited=payload.favorited, meta=_meta(payload)
     )
+
+
+@router.get("/history", response_model=list[HistoryOut])
+def history(
+    limit: int = Query(default=100, ge=1, le=500),
+    user: CurrentUser = Depends(require_user),
+) -> list[HistoryOut]:
+    """Articles this user has read, most recent first. Rendered from the
+    snapshot stored when they were marked read; nothing is fetched."""
+    return [HistoryOut(**item) for item in get_rss_service().history(user.user_id, limit=limit)]
 
 
 @router.get("/favorites", response_model=list[FavoriteOut])
