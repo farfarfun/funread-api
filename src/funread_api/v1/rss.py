@@ -92,6 +92,10 @@ class ArticleOut(BaseModel):
     pub_date: str
     description: str
     image: str
+    #: Audio/video attachment (podcasts, video feeds). Empty for plain articles
+    #: and for every legado-rule source -- those rules have no enclosure concept.
+    media_url: str = ""
+    media_type: str = ""
     read: bool
     favorited: bool
     #: Round-tripped back into GET /article -- rules capture values with @put
@@ -116,6 +120,8 @@ class ArticleDetail(BaseModel):
     pub_date: str
     description: str
     image: str
+    media_url: str = ""
+    media_type: str = ""
     content_html: str
 
 
