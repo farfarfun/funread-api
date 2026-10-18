@@ -471,3 +471,46 @@ def test_list_response_carries_variables(client):
 
     assert "variables" in page["items"][0]
     assert isinstance(page["items"][0]["variables"], dict)
+
+
+# ---------------------------------------------------------------- OPML
+
+OPML = """<opml version="2.0"><body>
+  <outline text="科技">
+    <outline text="示例博客" type="rss" xmlUrl="https://blog.example.com/feed.xml"/>
+    <outline text="挂掉的站" type="rss" xmlUrl="https://dead.example.com/feed.xml"/>
+  </outline>
+</body></opml>
+"""
+
+
+def test_import_opml_enters_everything_without_fetching(client):
+    response = client.post("/api/v1/rss/subscriptions/import", json={"opml": OPML})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"imported": 2, "skipped": 0, "total": 2}
+    titles = {s["feed_url"]: s for s in client.get("/api/v1/rss/subscriptions").json()}
+    dead = titles["https://dead.example.com/feed.xml"]
+    assert dead["title"] == "挂掉的站" and dead["group"] == "科技" and dead["last_error"] == ""
+
+
+def test_import_opml_is_idempotent(client):
+    client.post("/api/v1/rss/subscriptions/import", json={"opml": OPML})
+    again = client.post("/api/v1/rss/subscriptions/import", json={"opml": OPML}).json()
+    assert again == {"imported": 0, "skipped": 2, "total": 2}
+
+
+def test_a_wrong_file_is_a_400_with_the_reason(client):
+    response = client.post(
+        "/api/v1/rss/subscriptions/import", json={"opml": "<html><body>首页</body></html>"}
+    )
+    assert response.status_code == 400
+    assert "HTML 页面" in response.json()["detail"]
+
+
+def test_export_opml_round_trips_feed_subscriptions_only(client):
+    _subscribe_feed(client, title="示例博客")
+    _subscribe_legado(client)
+    body = client.get("/api/v1/rss/subscriptions/export").json()
+    assert body["count"] == 1
+    assert 'xmlUrl="https://blog.example.com/feed.xml"' in body["opml"]
+    assert "feed.example.com" not in body["opml"]

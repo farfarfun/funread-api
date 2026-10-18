@@ -37,6 +37,9 @@ MAX_ARTICLES_PER_PAGE = 100
 #: page, so a few hundred is already generous.
 MAX_READ_ALL_KEYS = 500
 
+#: Cap on an uploaded OPML. A thousand-feed export is well under 1 MB.
+MAX_OPML_CHARS = 2 * 1024 * 1024
+
 
 class RssSourceOut(BaseModel):
     url_id: int
@@ -78,6 +81,25 @@ class SubscriptionOut(BaseModel):
     read_count: int
     #: Only set right after subscribing to a feed: how many items it had.
     preview: int | None = None
+
+
+class OpmlIn(BaseModel):
+    #: The file's text. JSON-wrapped rather than multipart so the one request
+    #: path the front-end has (JSON + device token) covers it.
+    opml: str = Field(min_length=1, max_length=MAX_OPML_CHARS)
+
+
+class OpmlImportOut(BaseModel):
+    imported: int
+    #: Already subscribed, or not an http(s) URL.
+    skipped: int
+    total: int
+
+
+class OpmlOut(BaseModel):
+    opml: str
+    #: Feed subscriptions only -- archived legado sources have no portable URL.
+    count: int
 
 
 class CategoryOut(BaseModel):
@@ -268,6 +290,33 @@ def subscribe(
                 detail=f"无法订阅这个地址：{error}",
             ) from error
     return SubscriptionOut(**result)
+
+
+@router.post("/subscriptions/import", response_model=OpmlImportOut)
+def import_opml(payload: OpmlIn, user: CurrentUser = Depends(require_user)) -> OpmlImportOut:
+    """Bulk-subscribe from an OPML file. **Nothing is fetched here.**
+
+    Deliberately unlike ``POST /subscriptions`` (which validates before
+    saving): an OPML has hundreds of entries and some are always dead. They
+    all go in; a dead one gets its ``last_error`` the first time it is
+    opened, which the list already surfaces.
+    """
+    try:
+        result = get_rss_service().import_opml(payload.opml, user.user_id)
+    except Exception as error:
+        #  A malformed file is the caller's problem, reported with the reason.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"无法导入这份 OPML：{error}",
+        ) from error
+    return OpmlImportOut(**result)
+
+
+@router.get("/subscriptions/export", response_model=OpmlOut)
+def export_opml(user: CurrentUser = Depends(require_user)) -> OpmlOut:
+    """This user's feed subscriptions as OPML 2.0 text."""
+    text = get_rss_service().export_opml(user.user_id)
+    return OpmlOut(opml=text, count=text.count("xmlUrl="))
 
 
 @router.delete(
