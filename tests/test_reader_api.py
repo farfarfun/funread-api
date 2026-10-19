@@ -894,6 +894,21 @@ def test_pool_patch_rejects_an_unknown_source_type(client):
     assert client.patch("/api/v1/pool/video/1", json={"enabled": False}).status_code == 422
 
 
+def test_pool_tests_only_selected_sources_even_when_disabled(client):
+    client.post("/api/v1/reader/scan")
+    client.patch("/api/v1/pool/book/1", json={"enabled": False})
+
+    response = client.post(
+        "/api/v1/pool/test",
+        json={"source_type": "book", "url_ids": [1, 1, 999]},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["queued"] == 1
+    row = client.get("/api/v1/pool", params={"source_type": "book"}).json()["items"][0]
+    assert row["test_count"] == 1
+
+
 def test_pool_is_admin_only(client):
     """改一个源的启停会影响所有用户的搜索结果，不该由任意读者改。"""
     from accounts_support import make_account

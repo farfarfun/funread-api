@@ -214,6 +214,8 @@ class SourceTestIn(BaseModel):
     limit: int = Field(default=50, ge=1, le=500)
     #: 只测没测过的。想重新评估全部时置 false。
     untested_only: bool = False
+    #: 显式指定源时可测试已停用的源；不传则沿用候选池批量测试。
+    url_ids: list[int] | None = Field(default=None, min_length=1, max_length=500)
 
 
 class SourceTestAccepted(BaseModel):
@@ -253,15 +255,18 @@ def start_source_test(
     database_url = _database_url(payload.source_type)
     rows = list_source_prefs(
         source_type=payload.source_type,
-        enabled_only=True,
+        enabled_only=payload.url_ids is None,
         limit=None,
         database_url=database_url,
     )
-    if payload.untested_only:
-        rows = [row for row in rows if int(row.test_count or 0) == 0]
-    #  倒着取：`list_source_prefs` 已经按成功率排好序，没测过和成绩差的在后面，
-    #  而它们正是最需要重新测的。排在前面的那些刚证明过自己。
-    targets = [int(row.url_id) for row in rows[::-1][: payload.limit]]
+    if payload.url_ids is not None:
+        available = {int(row.url_id) for row in rows}
+        targets = list(dict.fromkeys(url_id for url_id in payload.url_ids if url_id in available))
+    else:
+        if payload.untested_only:
+            rows = [row for row in rows if int(row.test_count or 0) == 0]
+        #  成绩差和没测过的排在后面，先测它们。
+        targets = [int(row.url_id) for row in rows[::-1][: payload.limit]]
     if not targets:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有可测的源")
 
