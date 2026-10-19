@@ -53,6 +53,8 @@ def _register(client, username="alice", password="password123", code=""):
 
 def _bootstrap(client, username="alice", password="password123"):
     """Claim a fresh install: the first account needs no invite code."""
+    config.set_overrides(api_password="hunter2")
+    assert client.post("/api/v1/auth/admin/login", json={"password": "hunter2"}).status_code == 200
     response = _register(client, username=username, password=password)
     assert response.status_code == 201, response.text
     return response
@@ -179,6 +181,13 @@ def test_the_first_account_needs_no_invite_code(settings):
         #  Whoever claims the box is its admin -- they can then issue codes.
         assert body["role"] == UserRole.ADMIN
         assert client.get("/api/v1/shelf").status_code == 200
+
+
+def test_the_first_account_requires_a_configured_admin_password(settings):
+    with TestClient(create_app()) as client:
+        response = _register(client)
+    assert response.status_code == 403
+    assert "配置管理口令" in response.json()["detail"]
 
 
 def test_bootstrapping_requires_the_admin_password_when_one_is_set(settings):

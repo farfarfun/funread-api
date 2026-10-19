@@ -35,7 +35,7 @@ class SearchStats(BaseModel):
     #: a different keyword will not help, so the UI should say so.
     js_skipped: int
     failed: int
-    #: How many waves of concurrent requests it took.
+    #: Number of groups of SEARCH_WAVE_SIZE sources started; workers refill continuously.
     waves: int
     elapsed: float
     #: True when the candidate pool really ran out. Only then is "not found" a

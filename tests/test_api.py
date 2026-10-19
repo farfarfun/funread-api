@@ -1,3 +1,5 @@
+import json
+
 import requests
 from fastapi.testclient import TestClient
 
@@ -48,6 +50,15 @@ class _SourceResponse:
 
     def json(self):
         return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def iter_content(self, _size):
+        yield json.dumps(self.payload).encode()
 
 
 def test_source_management_flow(monkeypatch, tmp_path):

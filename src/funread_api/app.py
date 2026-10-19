@@ -28,9 +28,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_auth_db()
     if not auth_enabled():
         logger.warning(
-            "管理端口令未配置：所有接口无鉴权开放。"
-            "若本服务不是只监听 127.0.0.1，请立即在 config.toml 的 [auth] password "
-            "里配置口令（或写进 funsecret 的 funread/api/auth/password）。"
+            "管理端口令未配置：零账号时的试用数据可被未登录用户访问，首个账号也无法注册。"
+            "对局域网开放前请在 config.toml 的 [auth] password 里配置口令"
+            "（或写进 funsecret 的 funread/api/auth/password）。"
         )
     yield
 

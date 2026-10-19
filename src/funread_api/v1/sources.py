@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-import requests
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import AnyHttpUrl, BaseModel
 from sqlalchemy import func, select
@@ -73,9 +72,7 @@ def _get_or_404(session: Session, source_id: int) -> SourceListRecord:
 
 
 def _download(url: str) -> object:
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    return fetch_source_list_data(SourceListRecord(url=url, source_type="book"))[0]
 
 
 def _detect_source_type(payload: object) -> SourceType | None:

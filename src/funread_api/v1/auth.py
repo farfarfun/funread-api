@@ -130,12 +130,9 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
     Two paths, and which one applies depends only on whether any account exists:
 
     **First-run bootstrap** (no account yet). No invite code needed, and the
-    account is created as ``ADMIN``. This grants nothing that was not already
-    on offer: with zero accounts, ``security.resolve_current_user`` already
-    hands the implicit local identity to any request that satisfies the admin
-    guard. So this path is gated on *exactly that same* condition -- otherwise
-    a LAN-reachable instance with ``[auth] password`` set would have its
-    lockdown bypassed by a registration. It is deliberately **exempt** from
+    account is created as ``ADMIN``. A configured admin password is required
+    before the first account can be claimed; otherwise anyone on the LAN could
+    permanently take over a fresh installation. It is deliberately **exempt** from
     ``[auth] register_open``: that flag closes self-service signup by
     strangers, while this is the operator claiming their own box with the admin
     password. Honouring it here would make ``register_open = false`` a box that
@@ -153,6 +150,11 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
 
     is_first = await count_users(session) == 0
     if is_first:
+        if not resolve_api_password():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="请先配置管理口令，再注册首个账号",
+            )
         if not is_authenticated(request):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
