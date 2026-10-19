@@ -322,9 +322,8 @@ def explore_sources(
     and 19.3% of the sample both declare them and run without JS -- roughly
     2,500 sources across the full pool.
 
-    This is a table query only (``has_explore`` is computed during scan);
-    category names need the source file, so they are filled in for the current
-    page alone. Needs ``POST /reader/scan`` to have run.
+    The source index is built by ``POST /reader/scan``. Archived files may be
+    removed later, so the service verifies each candidate before pagination.
     """
     page = get_reader_service().explore_sources(limit=limit, offset=offset, q=q)
     return ExploreSourcePage(
