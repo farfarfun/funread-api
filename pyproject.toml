@@ -1,16 +1,14 @@
 [project]
 name = "funread-api"
-version = "1.2.4"
+version = "1.2.5"
 description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # [reader] pulls in lxml/cssselect/jsonpath-ng — the rule engine needs them,
     # the collection pipeline does not.
-    # 下界必须 >=1.1.104: `reader` extra 是 1.1.104 才有的。1.1.103 上
-    # `funread[reader]` 不报错, 只是解析成「没有额外依赖」—— lxml 静默缺席,
-    # 规则引擎在 import 时才炸。
-    "funread[reader,js]>=1.2.3",
+    # 阅读源规则入库与扫描接口从 1.2.5 开始提供。
+    "funread[reader,js]>=1.2.5",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
@@ -61,13 +59,6 @@ email = "farfarfun@qq.com"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.funbuild]
-# 发版时把 funread 的版本下界抬到最新 —— pip 默认 only-if-needed，下界不动的话
-# 已装的旧 funread 不会被升上来，而这个服务的规则引擎就跟着旧。
-# 用 latest-packages 而不是 funbuild.toml 的 packages：后者走 uv remove + uv add，
-# 会把上面那个 [reader] extra 丢掉。
-latest-packages = ["funread"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/funread_api"]

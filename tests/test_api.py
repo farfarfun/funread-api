@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from funread.base import config
 from funread.legado.manage.source.storage import upsert_source_list_record
+from funread.legado.reader import SourceRegistry
+from funread.legado.reader.storage import iter_source_json
 from funread_api.app import create_app
 
 
@@ -62,7 +64,8 @@ class _SourceResponse:
 
 
 def test_source_management_flow(monkeypatch, tmp_path):
-    config.set_overrides(database_url=f"sqlite:///{tmp_path / 'manage.db'}")
+    database_url = f"sqlite:///{tmp_path / 'manage.db'}"
+    config.set_overrides(database_url=database_url)
     payload = [{"bookSourceName": "测试", "bookSourceUrl": "https://books.example.com"}]
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _SourceResponse(payload))
 
@@ -75,6 +78,10 @@ def test_source_management_flow(monkeypatch, tmp_path):
             1,
             True,
         )
+        registry = SourceRegistry(cache_root=str(tmp_path / "empty"), database_url=database_url)
+        assert registry.scan()["scanned"] == 1
+        assert len(registry.candidates()) == 0  # 规则不完整，但已入库
+        assert registry.load_spec(next(iter_source_json("book", database_url))[0]) is not None
 
         duplicate = client.post("/api/v1/sources", json={"url": "https://example.com/books.json"})
         assert duplicate.status_code == 409

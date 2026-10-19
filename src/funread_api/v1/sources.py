@@ -18,6 +18,9 @@ from funread.legado.manage.source.storage import (
     get_session_factory,
     utcnow,
 )
+from funread.legado.reader import SourceRegistry
+
+from .deps import get_reader_service, get_rss_service
 
 router = APIRouter(prefix="/sources", tags=["sources"])
 SourceType = Literal["book", "rss"]
@@ -146,6 +149,8 @@ def create_source(payload: SourceCreate) -> SourceListRecordOut:
             last_queried_at=now,
             last_success_at=now,
         )
+        SourceRegistry(source_type=source_type).ingest([source_data])
+        (get_rss_service() if source_type == "rss" else get_reader_service()).registry.invalidate()
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -228,7 +233,12 @@ def collect_source(source_id: int) -> CollectReport:
         record = _get_or_404(session, source_id)
         record.last_queried_at = utcnow()
         try:
-            record.source_count = count_source_payloads(fetch_source_list_data(record))
+            payloads = fetch_source_list_data(record)
+            SourceRegistry(source_type=record.source_type).ingest(payloads)
+            (
+                get_rss_service() if record.source_type == "rss" else get_reader_service()
+            ).registry.invalidate()
+            record.source_count = count_source_payloads(payloads)
             record.last_success_at = record.last_queried_at
             record.consecutive_failures = 0
             record.last_error = None

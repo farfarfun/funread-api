@@ -4,16 +4,40 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, Query, status
+from farlog import getLogger
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from funread.legado.engine import BookInfo, Chapter
+from funread.legado.manage.source.storage import (
+    SourceListRecord,
+    add_source_list_url,
+    count_source_payloads,
+    fetch_source_list_data,
+    get_session_factory,
+    upsert_source_list_record,
+)
 from funread.legado.reader import DEFAULT_SEARCH_SOURCES
 from funread_api.security import CurrentUser, require_user
 
 from .deps import engine_errors, get_reader_service, get_rss_service
 
 router = APIRouter(prefix="/reader", tags=["reader"])
+logger = getLogger("funread")
+
+DEFAULT_SOURCE_LISTS = {
+    "book": (
+        "https://legado.aoaostar.com/sources/71e56d4f.json",
+        "https://legado.aoaostar.com/sources/4dc410d1.json",
+        "https://legado.aoaostar.com/sources/e3e5d620.json",
+    ),
+    "rss": (
+        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1000.json",
+        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1001.json",
+        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1002.json",
+    ),
+}
 
 
 class SearchStats(BaseModel):
@@ -365,18 +389,51 @@ def scan(
     source_type: str = Query(default="book", pattern="^(book|rss)$"),
     limit: int | None = Query(default=None, ge=1),
 ) -> ScanReport:
-    """Rebuild the candidate pool from the local source archive.
-
-    Required before the first search or subscription-directory browse -- until
-    this runs, ``reader_source_prefs`` is empty and both return nothing. The
-    two source types have separate pools, so ``source_type=rss`` is a separate
-    run, not a side effect of the book one.
-
-    Synchronous and slow (tens of thousands of small files); ``limit`` exists so
-    a smoke run stays quick.
-
-    Safe to re-run: it only refreshes the static verdicts and leaves the
-    live-result columns (``fail_count``/``last_ok_at``) alone.
-    """
+    """Refresh saved rules, fetching registered lists on an empty installation."""
     registry = get_rss_service().registry if source_type == "rss" else get_reader_service().registry
-    return ScanReport(source_type=source_type, **registry.scan(limit=limit))
+    report = registry.scan(limit=limit)
+    if report["scanned"] == 0 and limit is None:
+        with get_session_factory()() as session:
+            records = (
+                session.execute(
+                    select(SourceListRecord).where(
+                        SourceListRecord.source_type == source_type,
+                        SourceListRecord.enabled.is_(True),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if not records:
+            records = [
+                add_source_list_url(url=url, source_type=source_type)
+                for url in DEFAULT_SOURCE_LISTS[source_type]
+            ]
+        errors = []
+        for record in records:
+            try:
+                payloads = fetch_source_list_data(record)
+                registry.ingest(payloads)
+                upsert_source_list_record(
+                    url=record.url,
+                    source_type=source_type,
+                    source_count=count_source_payloads(payloads),
+                    fetch_succeeded=True,
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to import {record.url}: {exc}")
+                errors.append(str(exc))
+                upsert_source_list_record(
+                    url=record.url,
+                    source_type=source_type,
+                    source_count=record.source_count,
+                    fetch_succeeded=False,
+                    error=str(exc),
+                )
+        report = registry.scan()
+        if report["scanned"] == 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"未获取到有效源规则：{errors[-1] if errors else '源列表为空'}",
+            )
+    return ScanReport(source_type=source_type, **report)

@@ -86,22 +86,47 @@ def test_scan_reports_what_it_enabled(client):
     }
 
 
-def test_the_two_source_types_have_separate_pools(client):
+def test_the_two_source_types_have_separate_pools(client, monkeypatch):
     """rss 的候选池是另一次扫描，不是 book 那次的副作用。"""
+    monkeypatch.setattr(
+        "funread_api.v1.reader.fetch_source_list_data",
+        lambda record: [
+            [
+                {
+                    "sourceUrl": "https://feed.example.com",
+                    "sourceName": "测试订阅源",
+                    "ruleArticles": "class.item",
+                    "ruleTitle": "tag.h2@text",
+                    "ruleLink": "tag.a@href",
+                    "ruleContent": "class.body@html",
+                }
+            ]
+        ],
+    )
     book = client.post("/api/v1/reader/scan").json()
     rss = client.post("/api/v1/reader/scan", params={"source_type": "rss"}).json()
 
     assert book["enabled"] == 1
-    #  这个夹具的归档里只有 book 源，所以 rss 侧应当什么都没扫到
+    #  夹具没有 RSS 归档，扫描会从内置列表初始化独立的 RSS 池。
     assert rss == {
         "source_type": "rss",
-        "scanned": 0,
-        "complete": 0,
+        "scanned": 1,
+        "complete": 1,
         "needs_js": 0,
         "web_view": 0,
         "has_explore": 0,
-        "enabled": 0,
+        "enabled": 1,
     }
+
+
+def test_scan_reports_list_download_failure(client, monkeypatch):
+    def fail(_record):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr("funread_api.v1.reader.fetch_source_list_data", fail)
+    response = client.post("/api/v1/reader/scan", params={"source_type": "rss"})
+    assert response.status_code == 502
+    assert "download failed" in response.json()["detail"]
 
 
 def test_scan_rejects_an_unknown_source_type(client):
