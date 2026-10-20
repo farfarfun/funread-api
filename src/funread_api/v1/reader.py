@@ -398,28 +398,24 @@ def scan(
                 session.execute(
                     select(SourceListRecord).where(
                         SourceListRecord.source_type == source_type,
-                        SourceListRecord.enabled.is_(True),
+                        SourceListRecord.increment_start.is_(None),
+                        SourceListRecord.increment_stop.is_(None),
                     )
                 )
                 .scalars()
                 .all()
             )
-        if not records:
-            records = [
-                add_source_list_url(url=url, source_type=source_type)
-                for url in DEFAULT_SOURCE_LISTS[source_type]
-            ]
+        existing = {record.url: record for record in records}
+        registered = {url: record for url, record in existing.items() if record.enabled}
+        for url in DEFAULT_SOURCE_LISTS[source_type]:
+            if url not in existing:
+                registered[url] = add_source_list_url(url=url, source_type=source_type)
         errors = []
-        for record in records:
+        fetched = []
+        for record in registered.values():
             try:
                 payloads = fetch_source_list_data(record)
-                registry.ingest(payloads)
-                upsert_source_list_record(
-                    url=record.url,
-                    source_type=source_type,
-                    source_count=count_source_payloads(payloads),
-                    fetch_succeeded=True,
-                )
+                fetched.append((record, payloads))
             except Exception as exc:
                 logger.warning(f"Failed to import {record.url}: {exc}")
                 errors.append(str(exc))
@@ -429,6 +425,15 @@ def scan(
                     source_count=record.source_count,
                     fetch_succeeded=False,
                     error=str(exc),
+                )
+        if fetched:
+            registry.ingest([payload for _, payloads in fetched for payload in payloads])
+            for record, payloads in fetched:
+                upsert_source_list_record(
+                    url=record.url,
+                    source_type=source_type,
+                    source_count=count_source_payloads(payloads),
+                    fetch_succeeded=True,
                 )
         report = registry.scan()
         if report["scanned"] == 0:

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from funread.base import config
 from funread.legado.engine import StaticFetcher
+from funread.legado.manage.source.storage import add_source_list_url
 from funread.legado.reader import get_cached_chapter, save_cached_chapter
 from funread_api.app import create_app
 from funread_api.v1.deps import get_reader_service, reset_reader_services
@@ -58,7 +59,7 @@ def client(tmp_path):
     with TestClient(create_app()) as test_client:
         service = get_reader_service()
         service.fetcher_factory = lambda timeout=None: StaticFetcher(PAGES)
-        service.registry.scan()
+        service.registry.import_archive()
         test_client.service = service
         yield test_client
     reset_reader_services()
@@ -127,6 +128,36 @@ def test_scan_reports_list_download_failure(client, monkeypatch):
     response = client.post("/api/v1/reader/scan", params={"source_type": "rss"})
     assert response.status_code == 502
     assert "download failed" in response.json()["detail"]
+
+
+def test_scan_skips_incremental_lists_when_bootstrapping(client, monkeypatch):
+    add_source_list_url(
+        url="https://example.com/rss/{id}.json",
+        source_type="rss",
+        increment_start=0,
+        increment_stop=1000,
+    )
+    fetched = []
+
+    def fetch(record):
+        fetched.append(record.url)
+        return [
+            [
+                {
+                    "sourceUrl": "https://feed.example.com",
+                    "sourceName": "测试订阅源",
+                    "ruleArticles": "class.item",
+                    "ruleTitle": "tag.h2@text",
+                }
+            ]
+        ]
+
+    monkeypatch.setattr("funread_api.v1.reader.fetch_source_list_data", fetch)
+    report = client.post("/api/v1/reader/scan", params={"source_type": "rss"}).json()
+
+    assert report["scanned"] == 1
+    assert fetched
+    assert all("{id}" not in url for url in fetched)
 
 
 def test_scan_rejects_an_unknown_source_type(client):
@@ -767,7 +798,7 @@ def explore_client(tmp_path):
     with TestClient(create_app()) as test_client:
         service = get_reader_service()
         service.fetcher_factory = lambda timeout=None: StaticFetcher(EXPLORE_PAGES)
-        service.registry.scan()
+        service.registry.import_archive()
         yield test_client
     reset_reader_services()
 

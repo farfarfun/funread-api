@@ -1,6 +1,6 @@
 [project]
 name = "funread-api"
-version = "1.2.6"
+version = "1.2.7"
 description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,7 +8,7 @@ dependencies = [
     # [reader] pulls in lxml/cssselect/jsonpath-ng — the rule engine needs them,
     # the collection pipeline does not.
     # 阅读源规则入库与扫描接口从 1.2.5 开始提供。
-    "funread[reader,js]>=1.2.5",
+    "funread[reader,js]>=1.2.6",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
@@ -22,6 +22,7 @@ dependencies = [
     # async 引擎，阅读层继续走 funread 的同步引擎，同一个库两个连接。
     "aiosqlite>=0.20.0",
     "aiomysql>=0.2.0",
+    "asyncpg>=0.30.0",
     # Starlette 的 SessionMiddleware 签 cookie 用它，不是 starlette 的硬依赖。
     "itsdangerous>=2.1.0",
     # 命令行入口（src/funread_api/cli.py）用的框架。funread 那边也会间接带进来，

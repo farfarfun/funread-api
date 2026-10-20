@@ -76,7 +76,7 @@ def client(tmp_path):
     with TestClient(create_app()) as test_client:
         service = get_rss_service()
         service.fetcher_factory = lambda timeout=None: StaticFetcher(dict(PAGES))
-        #  The pool starts empty, same as a real install before the first scan.
+        service.registry.import_archive()
         test_client.post("/api/v1/reader/scan", params={"source_type": "rss"})
         yield test_client
     reset_reader_services()

@@ -162,9 +162,7 @@ class ReaderUserOut(BaseModel):
 # --------------------------------------------------------------- 异步引擎
 
 #: 异步驱动映射。键是同步 URL 的 drivername，值是对应的异步 drivername。
-#: `asyncpg` 不是本服务的硬依赖（它要编译扩展，而本地开发只用 SQLite、线上是
-#: MySQL），所以 PostgreSQL 这条映射写在这里但驱动要自己装 —— 装之前 URL
-#: 翻译照样正确，只是建引擎时 SQLAlchemy 会抛「找不到 asyncpg」。
+#: PostgreSQL 账号连接使用 asyncpg，安装包必须声明该驱动。
 _ASYNC_DRIVERS = {
     "sqlite": "sqlite+aiosqlite",
     "sqlite+pysqlite": "sqlite+aiosqlite",
