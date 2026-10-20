@@ -22,7 +22,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from funread.legado.reader import KIND_FEED, KIND_LEGADO
+from funread.legado.reader import KIND_FEED, KIND_LEGADO, storage
 from funread_api.security import CurrentUser, require_user
 
 from .deps import engine_errors, get_rss_service
@@ -145,6 +145,7 @@ class ArticleDetail(BaseModel):
     media_url: str = ""
     media_type: str = ""
     content_html: str
+    favorited: bool
 
 
 class ReadIn(BaseModel):
@@ -434,9 +435,15 @@ def read_article(
     """
     parsed = _parse_variables(variables)
     with engine_errors():
-        return ArticleDetail(
-            **get_rss_service().article(sub_id, user.user_id, link, variables=parsed, title=title)
-        )
+        service = get_rss_service()
+        article = service.article(sub_id, user.user_id, link, variables=parsed, title=title)
+        state = storage.get_article_states(
+            sub_id,
+            [article["article_key"]],
+            user_id=user.user_id,
+            database_url=service.database_url,
+        ).get(article["article_key"])
+        return ArticleDetail(**article, favorited=bool(state and state.favorited))
 
 
 @router.put(

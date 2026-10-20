@@ -286,6 +286,19 @@ def test_article_text_from_a_feed(client):
 
     assert body["title"] == "第一篇"
     assert "摘要一" in body["content_html"]
+    assert body["favorited"] is False
+
+    client.put(
+        f"/api/v1/rss/subscriptions/{sub_id}/articles/{body['article_key']}/favorite",
+        json={"favorited": True},
+    )
+    assert (
+        client.get(
+            "/api/v1/rss/article",
+            params={"sub_id": sub_id, "link": "https://blog.example.com/1"},
+        ).json()["favorited"]
+        is True
+    )
 
 
 def test_an_article_that_left_the_feed_is_a_404(client):
