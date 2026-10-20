@@ -1,6 +1,6 @@
 [project]
 name = "funread-api"
-version = "1.2.7"
+version = "1.2.8"
 description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
