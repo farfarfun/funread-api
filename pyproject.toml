@@ -1,6 +1,6 @@
 [project]
 name = "funread-api"
-version = "1.2.8"
+version = "1.2.9"
 description = "funread 采集源管理后端服务"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "SQLAlchemy>=2.0.0",
     "requests>=2.28.0",
+    "funsecret>=1.4.88",
     # 读者账号（注册/登录/邀请码/角色）整套走 funauth。它要求 py3.12 + SQLAlchemy
     # async，这也是账号表建在本服务而不是 funread 核心库里的原因 —— 后者下限是
     # 3.11，不该为了账号功能抬高只用采集的人的 Python 下限。

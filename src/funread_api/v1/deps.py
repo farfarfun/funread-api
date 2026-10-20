@@ -151,7 +151,7 @@ class TaskTracker:
         """Mid-flight update. The job stays ``running``."""
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or task.state != "running":
                 return
             task.done = done
             task.failed = failed
@@ -160,7 +160,7 @@ class TaskTracker:
         """Counts come in already mapped -- each job's stats dict has its own keys."""
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or task.state != "running":
                 return
             task.done = done
             task.failed = failed
@@ -170,11 +170,18 @@ class TaskTracker:
     def fail(self, task_id: str, detail: str) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or task.state != "running":
                 return
             task.state = "error"
             task.detail = detail[:500]
             task.finished_at = time.time()
+
+    def cancel(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.state == "running":
+                task.state = "cancelled"
+                task.finished_at = time.time()
 
     def get(self, task_id: str) -> Optional[BackgroundTask]:
         with self._lock:

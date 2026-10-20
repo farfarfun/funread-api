@@ -1,14 +1,18 @@
 """Reader and shelf routes, driven against a fake fetcher — nothing hits the network."""
 
 import json
+import threading
+import time
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
 from funread.base import config
 from funread.legado.engine import StaticFetcher
-from funread.legado.manage.source.storage import add_source_list_url
+from funread.legado.manage.source.storage import add_source_list_url, upsert_source_detail_record
 from funread.legado.reader import get_cached_chapter, save_cached_chapter
+from funread.legado.reader import storage as reader_storage
 from funread_api.app import create_app
 from funread_api.v1.deps import get_reader_service, reset_reader_services
 
@@ -950,6 +954,383 @@ def test_pool_patch_rejects_an_unknown_source_type(client):
     assert client.patch("/api/v1/pool/video/1", json={"enabled": False}).status_code == 422
 
 
+def test_pool_batch_toggle_updates_existing_sources_once(client):
+    client.post("/api/v1/reader/scan")
+    response = client.patch(
+        "/api/v1/pool/batch/book",
+        json={"url_ids": [1, 1, 999], "enabled": False},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"updated": 1}
+    assert client.get("/api/v1/pool").json()["items"][0]["enabled"] is False
+
+
+def test_pool_latest_test_actions_use_last_result_and_current_type(client):
+    client.post("/api/v1/reader/scan")
+    db = client.service.database_url
+    reader_storage.upsert_source_prefs(
+        [
+            {"source_type": "book", "url_id": 2, "enabled": False},
+            {
+                "source_type": "book",
+                "url_id": 3,
+                "enabled": True,
+                "test_count": 3,
+                "test_ok_count": 2,
+            },
+            {"source_type": "rss", "url_id": 4, "enabled": True},
+        ],
+        database_url=db,
+    )
+    reader_storage.record_source_test("book", 1, ok=True, database_url=db)
+    reader_storage.record_source_test("book", 1, ok=False, error="", database_url=db)
+    reader_storage.record_source_test("book", 2, ok=True, database_url=db)
+    reader_storage.record_source_test("rss", 4, ok=False, database_url=db)
+
+    summary = client.get("/api/v1/pool", params={"source_type": "book"}).json()["summary"]
+    assert summary["last_test_failed_enabled"] == 1
+    assert summary["last_test_success_disabled"] == 1
+    assert client.patch("/api/v1/pool/batch/book/latest-test/failure").json() == {"updated": 1}
+    assert client.patch("/api/v1/pool/batch/book/latest-test/success").json() == {"updated": 1}
+    rows = {row["url_id"]: row for row in client.get("/api/v1/pool").json()["items"]}
+    assert rows[1]["enabled"] is False and rows[1]["last_test_ok"] is False
+    assert rows[2]["enabled"] is True and rows[2]["last_test_ok"] is True
+    assert rows[3]["enabled"] is True and rows[3]["last_test_ok"] is None
+    client.post("/api/v1/reader/scan")
+    assert {row["url_id"]: row["enabled"] for row in client.get("/api/v1/pool").json()["items"]}[
+        1
+    ] is False
+    assert (
+        client.get("/api/v1/pool", params={"source_type": "rss"}).json()["items"][0]["enabled"]
+        is True
+    )
+    assert client.patch("/api/v1/pool/batch/book/latest-test/unknown").status_code == 422
+
+
+def test_pool_filters_untested_and_sorts_last_test_before_pagination(client):
+    client.post("/api/v1/reader/scan")
+    reader_storage.upsert_source_prefs(
+        [
+            {
+                "source_type": "book",
+                "url_id": 1,
+                "test_count": 1,
+                "last_test_at": datetime(2024, 1, 1),
+            },
+            {
+                "source_type": "book",
+                "url_id": 2,
+                "test_count": 1,
+                "last_test_at": datetime(2025, 1, 1),
+            },
+            {"source_type": "book", "url_id": 3},
+        ],
+        database_url=client.service.database_url,
+    )
+
+    base = "/api/v1/pool?source_type=book"
+    newest = client.get(f"{base}&sort=last_test_desc&limit=1&offset=1").json()
+    assert newest["total"] == 3
+    assert newest["items"][0]["url_id"] == 1
+    oldest = client.get(f"{base}&sort=last_test_asc").json()
+    assert [item["url_id"] for item in oldest["items"]] == [1, 2, 3]
+    untested = client.get(f"{base}&state=untested").json()
+    assert [item["url_id"] for item in untested["items"]] == [3]
+    assert untested["items"][0]["last_test_at"] == ""
+    assert client.get(f"{base}&limit=1000").json()["limit"] == 1000
+
+
+def test_pool_exposes_domains_and_sorts_other_columns_before_pagination(client):
+    client.post("/api/v1/reader/scan")
+    reader_storage.upsert_source_prefs(
+        [
+            {
+                "source_type": "book",
+                "url_id": 1,
+                "weight": 4,
+                "test_count": 2,
+                "test_ok_count": 1,
+                "source_json": {**SOURCE, "bookSourceUrl": "https://z.example.com/search"},
+            },
+            {
+                "source_type": "book",
+                "url_id": 2,
+                "name": "乙源",
+                "weight": 9,
+                "test_count": 2,
+                "test_ok_count": 2,
+                "source_json": {**SOURCE, "bookSourceUrl": "https://a.example.com/search"},
+            },
+            {"source_type": "book", "url_id": 3, "name": "丙源", "weight": 1},
+        ],
+        database_url=client.service.database_url,
+    )
+    upsert_source_detail_record(
+        "https://z.example.com/search",
+        "book",
+        source_id=1,
+        database_url=client.service.database_url,
+    )
+    upsert_source_detail_record(
+        "https://a.example.com/search",
+        "book",
+        source_id=2,
+        database_url=client.service.database_url,
+    )
+    base = "/api/v1/pool?source_type=book"
+    assert client.get(f"{base}&sort=weight_desc&limit=1&offset=1").json()["items"][0]["url_id"] == 1
+    assert client.get(f"{base}&sort=success_rate_desc").json()["items"][-1]["url_id"] == 3
+    first = client.get(f"{base}&sort=domain_asc&limit=1").json()["items"][0]
+    assert first["url_id"] == 2
+    assert first["domain"] == "a.example.com"
+    assert first["source_url"] == "https://a.example.com/search"
+    assert (
+        client.patch("/api/v1/pool/book/2", json={"weight": 8}).json()["domain"] == "a.example.com"
+    )
+
+
+def test_pool_rules_can_be_inspected_and_edited_without_stale_cache(client):
+    client.post("/api/v1/reader/scan")
+    path = "/api/v1/pool/book/1/rules"
+    detail = client.get(path).json()
+    assert detail["rules"]["bookSourceUrl"] == SOURCE["bookSourceUrl"]
+    assert detail["source"]["source_url"] == SOURCE["bookSourceUrl"]
+    assert client.service.registry.load_spec(1).name == SOURCE["bookSourceName"]
+
+    rules = {**detail["rules"], "bookSourceName": "改名源", "exploreUrl": "分类::/c"}
+    saved = client.put(path, json={"rules": rules, "updated_at": detail["updated_at"]})
+    assert saved.status_code == 200
+    assert saved.json()["source"]["name"] == "改名源"
+    assert saved.json()["source"]["has_explore"] is True
+    assert client.service.registry.load_spec(1).name == "改名源"
+    assert client.get("/api/v1/pool").json()["items"][0]["name"] == "改名源"
+    assert (
+        client.put(path, json={"rules": rules, "updated_at": detail["updated_at"]}).status_code
+        == 409
+    )
+    assert (
+        client.put(path, json={"rules": [], "updated_at": saved.json()["updated_at"]}).status_code
+        == 422
+    )
+
+
+def test_pool_rule_address_edit_updates_the_existing_index(client):
+    client.post("/api/v1/reader/scan")
+    upsert_source_detail_record(
+        "a.example.com", "book", source_id=1, database_url=client.service.database_url
+    )
+    path = "/api/v1/pool/book/1/rules"
+    detail = client.get(path).json()
+    changed = {**detail["rules"], "bookSourceUrl": "https://fixed.example.org/path"}
+    saved = client.put(path, json={"rules": changed, "updated_at": detail["updated_at"]})
+    assert saved.status_code == 200
+    assert saved.json()["index_key"] == "fixed.example.org"
+    assert saved.json()["source"]["source_url"] == "https://fixed.example.org/path"
+    assert client.get("/api/v1/pool").json()["items"][0]["domain"] == "fixed.example.org"
+    assert (
+        client.put(
+            path,
+            json={
+                "rules": {**changed, "bookSourceUrl": "oops"},
+                "updated_at": saved.json()["updated_at"],
+            },
+        ).status_code
+        == 422
+    )
+
+
+def test_pool_clear_queue_cancels_waiting_and_stops_active_after_current_source(
+    client, monkeypatch
+):
+    from funread_api.v1 import pool
+
+    client.post("/api/v1/reader/scan")
+    reader_storage.upsert_source_prefs(
+        [{"source_type": "book", "url_id": 2}], database_url=client.service.database_url
+    )
+    started = threading.Event()
+    release = threading.Event()
+    tested = []
+
+    def test_source(url_id):
+        tested.append(url_id)
+        started.set()
+        assert release.wait(5)
+        return True, ""
+
+    monkeypatch.setattr(client.service, "test_source", test_source)
+    try:
+        first = client.post(
+            "/api/v1/pool/test", json={"source_type": "book", "url_ids": [1, 2]}
+        ).json()
+        assert started.wait(5)
+        second = client.post(
+            "/api/v1/pool/test", json={"source_type": "book", "url_ids": [2]}
+        ).json()
+        assert client.delete("/api/v1/pool/test/queue").json() == {"cancelled": 2}
+        assert client.get(f"/api/v1/pool/test/{first['task_id']}").json()["state"] == "cancelled"
+        assert client.get(f"/api/v1/pool/test/{second['task_id']}").json()["state"] == "cancelled"
+        release.set()
+        worker = pool._source_test_queue._worker
+        assert worker is not None
+        worker.join(timeout=5)
+        assert tested == [1]
+        assert pool._source_test_queue._pending == {}
+    finally:
+        release.set()
+
+
+def test_pool_one_click_tests_all_enabled_sources_oldest_first(client, monkeypatch):
+    from funread_api.v1 import pool
+
+    client.post("/api/v1/reader/scan")
+    reader_storage.upsert_source_prefs(
+        [
+            {
+                "source_type": "book",
+                "url_id": 1,
+                "enabled": True,
+                "last_test_at": datetime(2025, 1, 1),
+                "source_json": SOURCE,
+            },
+            {
+                "source_type": "book",
+                "url_id": 2,
+                "enabled": True,
+                "last_test_at": datetime(2024, 1, 1),
+                "source_json": SOURCE,
+            },
+            {"source_type": "book", "url_id": 3, "enabled": True, "source_json": SOURCE},
+            {"source_type": "book", "url_id": 4, "enabled": False, "source_json": SOURCE},
+            {"source_type": "book", "url_id": 5, "enabled": True},
+        ],
+        database_url=client.service.database_url,
+    )
+    started = threading.Event()
+    captured = []
+
+    def run(task_id, source_type, url_ids, database_url):
+        captured.extend(url_ids)
+        pool.get_source_test_tracker().finish(task_id, done=len(url_ids), failed=0)
+        started.set()
+
+    monkeypatch.setattr(pool, "_run_source_test", run)
+    response = client.post("/api/v1/pool/test/all?source_type=book")
+    assert response.status_code == 202
+    assert response.json()["queued"] == 4
+    assert started.wait(5)
+    assert captured == [3, 4, 2, 1]
+
+
+def test_pool_test_queue_spaces_repeated_domains(monkeypatch):
+    from types import SimpleNamespace
+
+    from funread_api.v1 import pool
+
+    queue = pool.SourceTestQueue()
+    clock = [100.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(pool, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    assert queue.wait_for_domain("task", "same.example")
+    assert queue.wait_for_domain("task", "other.example")
+    assert sleeps == []
+    assert queue.wait_for_domain("task", "same.example")
+    assert sum(sleeps) == 30
+    queue._cancelled.add("task")
+    assert not queue.wait_for_domain("task", "same.example")
+
+
+def test_pool_rss_ai_optimizer_suggests_only_rules_that_parse_the_fetched_page(client, monkeypatch):
+    from funread_api.v1 import rss_optimize
+    from funread_api.v1.deps import get_rss_service
+
+    rules = {
+        "sourceUrl": "https://rss.example.com/list",
+        "sourceName": "RSS 源",
+        "ruleArticles": "class.missing",
+        "ruleTitle": "tag.h2@text",
+    }
+    reader_storage.upsert_source_prefs(
+        [{"source_type": "rss", "url_id": 7, "source_json": rules}],
+        database_url=client.service.database_url,
+    )
+    get_rss_service().fetcher_factory = lambda timeout=None: StaticFetcher(
+        {
+            "https://rss.example.com/list": '<div class="item"><h2>文章一</h2><a href="/one">阅读全文</a></div>'
+        }
+    )
+    monkeypatch.setattr(
+        rss_optimize,
+        "read_secret",
+        lambda *args: {
+            "base_url": "https://model.example.com/v1",
+            "model": "deepseek/deepseek-chat",
+            "api_key": "test-key",
+        }[args[-1]],
+    )
+    sent = []
+    proposed = {"articles": "class.item", "title": "tag.h2@text", "link": "tag.a@href"}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "arguments": json.dumps(
+                                            {
+                                                "reason": "列表选择器已变更",
+                                                "rules": proposed,
+                                            }
+                                        )
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    def post(url, **kwargs):
+        sent.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(rss_optimize.requests, "post", post)
+    result = client.post("/api/v1/pool/rss/7/optimize")
+    assert result.status_code == 200
+    assert result.json()["status"] == "suggested"
+    assert result.json()["after_count"] == 1
+    assert result.json()["rules"]["ruleRss"]["articles"] == "class.item"
+    assert sent[0][0] == "https://model.example.com/v1/chat/completions"
+    assert sent[0][1]["json"]["tools"][0]["function"]["name"] == "suggest_rss_rules"
+    assert client.get("/api/v1/pool/rss/7/rules").json()["rules"] == rules
+
+    working = {**rules, "ruleRss": proposed}
+    reader_storage.upsert_source_prefs(
+        [{"source_type": "rss", "url_id": 7, "source_json": working}],
+        database_url=client.service.database_url,
+    )
+    assert client.post("/api/v1/pool/rss/7/optimize").json()["status"] == "ok"
+    assert len(sent) == 1
+    reader_storage.upsert_source_prefs(
+        [{"source_type": "rss", "url_id": 7, "source_json": rules}],
+        database_url=client.service.database_url,
+    )
+    proposed["articles"] = "class.nope"
+    assert client.post("/api/v1/pool/rss/7/optimize").status_code == 422
+
+
 def test_pool_tests_only_selected_sources_even_when_disabled(client):
     client.post("/api/v1/reader/scan")
     client.patch("/api/v1/pool/book/1", json={"enabled": False})
@@ -961,8 +1342,88 @@ def test_pool_tests_only_selected_sources_even_when_disabled(client):
 
     assert response.status_code == 202
     assert response.json()["queued"] == 1
+    task_id = response.json()["task_id"]
+    deadline = time.monotonic() + 5
+    while client.get(f"/api/v1/pool/test/{task_id}").json()["state"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
     row = client.get("/api/v1/pool", params={"source_type": "book"}).json()["items"][0]
     assert row["test_count"] == 1
+
+
+def test_pool_accepts_another_batch_while_the_consumer_is_busy(client, monkeypatch):
+    from funread_api.v1 import pool
+
+    client.post("/api/v1/reader/scan")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+    order = []
+
+    def run(task_id, source_type, url_ids, database_url):
+        order.append(task_id)
+        if len(order) == 1:
+            first_started.set()
+            assert release_first.wait(5)
+        else:
+            second_done.set()
+        pool.get_source_test_tracker().finish(task_id, done=len(url_ids), failed=0)
+
+    monkeypatch.setattr(pool, "_run_source_test", run)
+    try:
+        first = client.post("/api/v1/pool/test", json={"source_type": "book", "url_ids": [1]})
+        assert first.status_code == 202
+        assert first_started.wait(5)
+        second = client.post("/api/v1/pool/test", json={"source_type": "book", "url_ids": [1]})
+        assert second.status_code == 202
+        assert not second_done.is_set()
+        release_first.set()
+        assert second_done.wait(5)
+        worker = pool._source_test_queue._worker
+        if worker is not None:
+            worker.join(timeout=5)
+        assert pool._source_test_queue._worker is None
+        assert order == [first.json()["task_id"], second.json()["task_id"]]
+    finally:
+        release_first.set()
+
+
+def test_pool_auto_batches_skip_sources_already_in_the_queue(monkeypatch):
+    from funread_api.v1 import pool
+
+    queue = pool.SourceTestQueue()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    tested = []
+
+    def run(task_id, source_type, url_ids, database_url):
+        tested.extend(url_ids)
+        if len(tested) == 1:
+            first_started.set()
+            assert release_first.wait(5)
+
+    monkeypatch.setattr(pool, "_run_source_test", run)
+    try:
+        first = queue.submit("book", [1, 2], 1, False, 1, None)
+        assert first is not None
+        assert first_started.wait(5)
+        second = queue.submit("book", [1, 2], 1, False, 1, None)
+        assert second is not None
+        release_first.set()
+        worker = queue._worker
+        assert worker is not None
+        worker.join(timeout=5)
+        assert queue._worker is None
+        assert tested == [1, 2]
+        third = queue.submit("book", [1], 1, False, 1, None)
+        assert third is not None
+        restarted = queue._worker
+        assert restarted is not None and restarted is not worker
+        restarted.join(timeout=5)
+        assert queue._worker is None
+        assert tested == [1, 2, 1]
+    finally:
+        release_first.set()
 
 
 def test_pool_is_admin_only(client):
@@ -974,3 +1435,4 @@ def test_pool_is_admin_only(client):
 
     assert client.get("/api/v1/pool").status_code == 401
     assert client.patch("/api/v1/pool/book/1", json={"enabled": False}).status_code == 401
+    assert client.delete("/api/v1/pool/test/queue").status_code == 401
