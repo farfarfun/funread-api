@@ -14,7 +14,7 @@ from funread.legado.manage.source.storage import init_source_db
 from funread.legado.reader import init_reader_db
 from funread_api.accounts import init_auth_db, resolve_session_secret
 from funread_api.security import SESSION_TTL, auth_enabled, resolve_cors_origins
-from funread_api.v1 import api_router
+from funread_api.v1 import api_router, sso
 
 logger = logging.getLogger("funread_api")
 
@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_source_db()
     init_reader_db()
     init_auth_db()
-    if not auth_enabled():
+    if app.state.oidc_config is None and not auth_enabled():
         logger.warning(
             "管理端口令未配置：零账号时的试用数据可被未登录用户访问，首个账号也无法注册。"
             "对局域网开放前请在 config.toml 的 [auth] password 里配置口令"
@@ -46,13 +46,14 @@ def create_app() -> FastAPI:
     #  (see `resolve_session_secret`) rather than random-per-start: a month-long
     #  reading session must survive a restart, and this service gets restarted
     #  by whoever is self-hosting it far more often than a cloud deployment.
+    oidc_enabled = sso.configure(app)
     app.add_middleware(
         SessionMiddleware,
         secret_key=resolve_session_secret(),
         max_age=SESSION_TTL,
         same_site="lax",
         #  Plain http on a LAN IP -- a secure cookie would never come back.
-        https_only=False,
+        https_only=oidc_enabled,
     )
     #  跨站来源。Web 前端是同源反代 `/api`，用不着 CORS；需要它的是**套壳和
     #  原生客户端** —— 它们把页面打包在 app 里，请求用户自己的服务器属于跨站。
@@ -71,6 +72,14 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(api_router, prefix="/api/v1")
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict:

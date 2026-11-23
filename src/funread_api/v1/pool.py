@@ -27,7 +27,13 @@ from sqlalchemy.exc import IntegrityError
 from funread.legado.engine import load_source
 from funread.legado.manage.source.storage import SourceDetailRecord, compute_url_md5
 from funread.legado.manage.utils import url_to_hostname
-from funread.legado.reader import list_source_prefs, record_source_test, reset_source_tests
+from funread.legado.reader import (
+    list_source_prefs,
+    query_source_prefs,
+    record_source_test,
+    reset_source_tests,
+    summarize_source_prefs,
+)
 from funread.legado.reader.registry import _rss_identity
 from funread.legado.reader.storage import ReaderSourcePref, get_session_factory
 from funread_api.security import CurrentUser, require_reader_admin
@@ -193,32 +199,36 @@ def list_pool(
 ) -> PoolPage:
     """列出候选源池。
 
-    取全量再在内存里筛，不下推到 SQL：池子最大 13k 行、单表单次查询，而 `state`
-    的三个取值要组合 `enabled` 与 `fail_count` 两个条件，下推进去会把
-    `list_source_prefs` 的签名撑成一堆布尔开关。要是哪天池子涨到十万行再说。
+    汇总计数与大多数筛选排序直接下推到 SQL，避免万级源每次翻页都全表加载进 Python 内存；
+    仅在按 JSON 内的 `domain` / `source_url` 排序时回落按需提取 URL 排序。
     """
+    database_url = _database_url(source_type)
+    summary = summarize_source_prefs(source_type=source_type, database_url=database_url)
+
+    if not sort.startswith(("domain_", "source_url_")):
+        visible, total = query_source_prefs(
+            source_type=source_type,
+            q=q,
+            state=state,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+            database_url=database_url,
+        )
+        urls = _source_urls(source_type, [int(row.url_id) for row in visible], database_url)
+        return PoolPage(
+            items=[_to_out(row, urls.get(int(row.url_id), "")) for row in visible],
+            total=total,
+            limit=limit,
+            offset=offset,
+            summary=summary,
+        )
+
     rows = list_source_prefs(
         source_type=source_type,
         enabled_only=False,
-        database_url=_database_url(source_type),
+        database_url=database_url,
     )
-    summary = {
-        "total": len(rows),
-        "enabled": sum(1 for row in rows if row.enabled),
-        "complete": sum(1 for row in rows if row.is_complete),
-        "needs_js": sum(1 for row in rows if row.needs_js),
-        "has_explore": sum(1 for row in rows if row.has_explore),
-        #  实跑成功过的 —— 这个数字才是池子的真实健康度
-        "proven": sum(1 for row in rows if row.last_ok_at is not None),
-        "failing": sum(1 for row in rows if (row.fail_count or 0) > 0),
-        "last_test_failed_enabled": sum(
-            1 for row in rows if row.last_test_ok is False and row.enabled
-        ),
-        "last_test_success_disabled": sum(
-            1 for row in rows if row.last_test_ok is True and not row.enabled
-        ),
-    }
-
     keyword = q.strip()
     if keyword:
         rows = [row for row in rows if keyword in (row.name or "")]
@@ -231,43 +241,18 @@ def list_pool(
     elif state == "untested":
         rows = [row for row in rows if int(row.test_count or 0) == 0]
 
-    database_url = _database_url(source_type)
-    urls = (
-        _source_urls(source_type, [int(row.url_id) for row in rows], database_url)
-        if sort.startswith(("domain_", "source_url_"))
-        else {}
+    urls = _source_urls(source_type, [int(row.url_id) for row in rows], database_url)
+    field, direction = sort.rsplit("_", 1)
+    key_fn = (
+        (lambda row: _domain(urls.get(int(row.url_id), "")).casefold())
+        if field == "domain"
+        else (lambda row: urls.get(int(row.url_id), "").casefold())
     )
-    if sort != "rank":
-        field, direction = sort.rsplit("_", 1)
-        keys = {
-            "url_id": lambda row: int(row.url_id),
-            "name": lambda row: (row.name or "").casefold(),
-            "domain": lambda row: _domain(urls.get(int(row.url_id), "")).casefold(),
-            "source_url": lambda row: urls.get(int(row.url_id), "").casefold(),
-            "verdict": lambda row: bool(row.is_complete),
-            "proven": lambda row: row.last_ok_at,
-            "success_rate": lambda row: (
-                int(row.test_ok_count or 0) / int(row.test_count) if row.test_count else None
-            ),
-            "last_test": lambda row: row.last_test_at,
-            "last_error": lambda row: (row.last_error or "").casefold(),
-            "weight": lambda row: int(row.weight or 0),
-            "enabled": lambda row: bool(row.enabled),
-        }
-
-        def sort_value(row: ReaderSourcePref):
-            return keys[field](row)
-
-        present = [row for row in rows if sort_value(row) not in (None, "")]
-        missing = [row for row in rows if sort_value(row) in (None, "")]
-        present.sort(
-            key=lambda row: (sort_value(row), int(row.url_id)), reverse=direction == "desc"
-        )
-        rows = present + missing
-
+    present = [row for row in rows if key_fn(row) not in (None, "")]
+    missing = [row for row in rows if key_fn(row) in (None, "")]
+    present.sort(key=lambda row: (key_fn(row), int(row.url_id)), reverse=direction == "desc")
+    rows = present + missing
     visible = rows[offset : offset + limit]
-    if not urls:
-        urls = _source_urls(source_type, [int(row.url_id) for row in visible], database_url)
 
     return PoolPage(
         items=[_to_out(row, urls.get(int(row.url_id), "")) for row in visible],
@@ -282,7 +267,7 @@ def list_pool(
 def patch_pool_sources(source_type: str, payload: PoolBatchPatchIn) -> dict[str, int]:
     if source_type not in ("book", "rss"):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="source_type 只能是 book 或 rss",
         )
     ids = set(payload.url_ids)
@@ -330,7 +315,7 @@ def patch_pool_source(
     """
     if source_type not in ("book", "rss"):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="source_type 只能是 book 或 rss",
         )
 
@@ -756,7 +741,7 @@ def reset_scores(
     """清空测试计数。源站换了域名、规则修好了之后，旧样本会一直压着它排不上来。"""
     if source_type not in ("book", "rss"):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="source_type 只能是 book 或 rss",
         )
     affected = reset_source_tests(

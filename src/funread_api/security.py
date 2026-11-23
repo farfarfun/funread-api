@@ -40,6 +40,7 @@ from funread.legado.reader import LOCAL_USER_ID
 from funread.legado.reader.storage import utcnow
 from funread_api.accounts import (
     ReaderDeviceToken,
+    ReaderUser,
     UserRole,
     accounts,
     count_users,
@@ -220,7 +221,28 @@ def _bearer_token(request: Request) -> Optional[str]:
     return value.strip()
 
 
-async def _user_from_device_token(session: AsyncSession, raw: str) -> Optional[CurrentUser]:
+def _current_user(request: Request, user: ReaderUser) -> Optional[CurrentUser]:
+    oidc = request.app.state.oidc_config
+    if oidc is not None:
+        if user.oidc_issuer != oidc.issuer or not user.oidc_subject:
+            return None
+    return CurrentUser(
+        user_id=int(user.id), username=user.username, role=effective_role(request, user)
+    )
+
+
+def effective_role(request: Request, user: ReaderUser) -> UserRole:
+    oidc = request.app.state.oidc_config
+    if oidc is None:
+        return user.role
+    if (user.oidc_issuer, user.oidc_subject) == (oidc.issuer, oidc.admin_subject):
+        return UserRole.ADMIN
+    return UserRole.GUEST
+
+
+async def _user_from_device_token(
+    request: Request, session: AsyncSession, raw: str
+) -> Optional[CurrentUser]:
     """校验设备 token，顺带刷新 `last_seen_at`。"""
     if not raw:
         return None
@@ -239,7 +261,7 @@ async def _user_from_device_token(session: AsyncSession, raw: str) -> Optional[C
     if row.last_seen_at is None or (now - row.last_seen_at).total_seconds() > 3600:
         row.last_seen_at = now
         await session.commit()
-    return CurrentUser(user_id=int(user.id), username=user.username, role=user.role)
+    return _current_user(request, user)
 
 
 async def resolve_current_user(request: Request, session: AsyncSession) -> Optional[CurrentUser]:
@@ -267,7 +289,7 @@ async def resolve_current_user(request: Request, session: AsyncSession) -> Optio
     #  「token 过期了为什么还能用」这类问题完全无法排查。
     bearer = _bearer_token(request)
     if bearer is not None:
-        return await _user_from_device_token(session, bearer)
+        return await _user_from_device_token(request, session, bearer)
 
     raw = session_store.current(request)
     if raw:
@@ -282,9 +304,16 @@ async def resolve_current_user(request: Request, session: AsyncSession) -> Optio
         if user is None or not user.is_active:
             session_store.logout(request)
             return None
-        return CurrentUser(user_id=int(user.id), username=user.username, role=user.role)
+        current = _current_user(request, user)
+        if current is None:
+            session_store.logout(request)
+        return current
 
-    if await count_users(session) == 0 and is_authenticated(request):
+    if (
+        request.app.state.oidc_config is None
+        and await count_users(session) == 0
+        and is_authenticated(request)
+    ):
         return LOCAL_USER
     return None
 
@@ -325,7 +354,7 @@ async def require_reader(request: Request, user: OptionalUser) -> None:
     a public reader is a reasonable thing to want (share the LAN address, no
     login prompt). Anything that writes per-user state uses ``require_user``.
     """
-    if is_authenticated(request) or user is not None:
+    if user is not None or (request.app.state.oidc_config is None and is_authenticated(request)):
         return
     if request.method in _SAFE_METHODS and reader_is_public():
         return

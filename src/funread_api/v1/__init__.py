@@ -8,11 +8,13 @@ from .reader import router as reader_router
 from .rss import router as rss_router
 from .shelf import router as shelf_router
 from .sources import router as sources_router
+from .sso import router as sso_router
 
 api_router = APIRouter()
 
 #  /auth is the way in, so it cannot require a session itself.
 api_router.include_router(auth_router)
+api_router.include_router(sso_router)
 
 #  管理端按**账号角色**鉴权：必须是登录着的 ADMIN。
 #

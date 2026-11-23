@@ -79,10 +79,15 @@ class ReaderUser(UserMixin, TimestampMixin, AuthBase):
     __tablename__ = "reader_user"
     #: 唯一约束由宿主命名：funauth 的 mixin 不替宿主起约束名，否则两个用了
     #: 同一个 mixin 的库在同一个 PostgreSQL 实例里会撞名。
-    __table_args__ = (sa.UniqueConstraint("username", name="uq_reader_user_username"),)
+    __table_args__ = (
+        sa.UniqueConstraint("username", name="uq_reader_user_username"),
+        sa.Index("uq_reader_user_oidc_identity", "oidc_issuer", "oidc_subject", unique=True),
+    )
 
     #: 覆盖 `UserMixin` 的 UUID 主键，理由见模块 docstring。
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    oidc_issuer: Mapped[str | None] = mapped_column(sa.String(255))
+    oidc_subject: Mapped[str | None] = mapped_column(sa.String(255))
 
 
 class ReaderDeviceToken(TimestampMixin, AuthBase):
@@ -350,6 +355,19 @@ def init_auth_db(database_url: Optional[str] = None) -> None:
     #  先迁移再 create_all：create_all 只跳过已存在的表，不会去改它的形状
     _migrate_legacy_user_table(engine)
     AuthBase.metadata.create_all(engine)
+    columns = {column["name"] for column in sa.inspect(engine).get_columns("reader_user")}
+    if {"oidc_issuer", "oidc_subject"} - columns:
+        with engine.begin() as connection:
+            for name in ("oidc_issuer", "oidc_subject"):
+                if name not in columns:
+                    connection.execute(
+                        sa.text(f"ALTER TABLE reader_user ADD COLUMN {name} VARCHAR(255)")
+                    )
+    next(
+        index
+        for index in ReaderUser.__table__.indexes
+        if index.name == "uq_reader_user_oidc_identity"
+    ).create(engine, checkfirst=True)
     _AUTH_INITIALIZED.add(key)
 
 

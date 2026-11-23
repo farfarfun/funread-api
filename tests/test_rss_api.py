@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from funread.base import config
 from funread.legado.engine import StaticFetcher
+from funread.legado.reader import storage as reader_storage
 from funread_api.app import create_app
 from funread_api.v1.deps import get_rss_service, reset_reader_services
 
@@ -275,6 +276,35 @@ def test_article_text_from_an_archived_source(client):
 
     assert "归档正文" in body["content_html"]
     assert body["article_key"]
+
+
+def test_article_without_content_rule_still_has_a_detail_page(client):
+    sub_id = _subscribe_legado(client).json()["sub_id"]
+    service = get_rss_service()
+    reader_storage.upsert_source_prefs(
+        [
+            {
+                "source_type": "rss",
+                "url_id": 1,
+                "source_json": {
+                    key: value for key, value in LEGADO_SOURCE.items() if key != "ruleContent"
+                },
+            }
+        ],
+        database_url=service.database_url,
+    )
+    service.registry.invalidate(1)
+    page = client.get("/api/v1/rss/articles", params={"sub_id": sub_id}).json()
+    assert page["has_content"] is False
+    first = page["items"][0]
+    response = client.get(
+        "/api/v1/rss/article",
+        params={"sub_id": sub_id, "link": first["link"], "title": first["title"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["title"] == first["title"]
+    assert response.json()["link"] == first["link"]
+    assert response.json()["content_html"] == ""
 
 
 def test_article_text_from_a_feed(client):

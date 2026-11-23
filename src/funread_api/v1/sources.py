@@ -6,8 +6,8 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import AnyHttpUrl, BaseModel
-from sqlalchemy import func, select
+from pydantic import AnyHttpUrl, BaseModel, Field
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from funread.legado.manage.source.storage import (
@@ -58,6 +58,7 @@ class SourceListPage(BaseModel):
     total: int
     limit: int
     offset: int
+    summary: dict[str, int] = Field(default_factory=dict)
 
 
 class CollectReport(BaseModel):
@@ -120,7 +121,7 @@ def create_source(payload: SourceCreate) -> SourceListRecordOut:
             source_data = _download(url)
         except Exception as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"无法读取采集源：{exc}",
             ) from exc
 
@@ -128,7 +129,7 @@ def create_source(payload: SourceCreate) -> SourceListRecordOut:
         source_type = payload.source_type or detected
         if source_type is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="无法识别采集源类型，请选择书源或 RSS 源",
             )
         if (
@@ -137,7 +138,7 @@ def create_source(payload: SourceCreate) -> SourceListRecordOut:
             and detected != payload.source_type
         ):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"采集源内容识别为 {detected}，与所选类型 {payload.source_type} 不一致",
             )
 
@@ -157,6 +158,17 @@ def create_source(payload: SourceCreate) -> SourceListRecordOut:
         return SourceListRecordOut.model_validate(record)
 
 
+_SOURCE_SORT_COLUMNS = {
+    "id": SourceListRecord.id,
+    "source_type": SourceListRecord.source_type,
+    "url": SourceListRecord.url,
+    "source_count": SourceListRecord.source_count,
+    "last_queried_at": SourceListRecord.last_queried_at,
+    "consecutive_failures": SourceListRecord.consecutive_failures,
+    "enabled": SourceListRecord.enabled,
+}
+
+
 @router.get("", response_model=SourceListPage)
 def list_sources(
     limit: int = Query(default=50, ge=1, le=500),
@@ -164,9 +176,35 @@ def list_sources(
     source_type: SourceType | None = None,
     enabled: bool | None = None,
     keyword: str | None = Query(default=None, min_length=1, max_length=255),
+    sort: str = Query(
+        default="id_desc",
+        pattern="^(id|source_type|url|source_count|last_queried_at|consecutive_failures|enabled)_(asc|desc)$",
+    ),
 ) -> SourceListPage:
     session_factory = get_session_factory()
     with session_factory() as session:
+        agg = session.execute(
+            select(
+                func.count().label("total"),
+                func.sum(case((SourceListRecord.enabled.is_(True), 1), else_=0)).label("enabled"),
+                func.sum(case((SourceListRecord.consecutive_failures > 0, 1), else_=0)).label(
+                    "failing"
+                ),
+                func.sum(
+                    case(
+                        (SourceListRecord.source_count > 0, SourceListRecord.source_count),
+                        else_=0,
+                    )
+                ).label("total_rules"),
+            )
+        ).one()
+        summary = {
+            "total": int(agg.total or 0),
+            "enabled": int(agg.enabled or 0),
+            "failing": int(agg.failing or 0),
+            "total_rules": int(agg.total_rules or 0),
+        }
+
         filters = []
         if source_type is not None:
             filters.append(SourceListRecord.source_type == source_type)
@@ -177,11 +215,15 @@ def list_sources(
         total = session.execute(
             select(func.count()).select_from(SourceListRecord).where(*filters)
         ).scalar_one()
+
+        sort_field, sort_dir = sort.rsplit("_", 1)
+        sort_col = _SOURCE_SORT_COLUMNS[sort_field]
+        order_expr = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
         rows = (
             session.execute(
                 select(SourceListRecord)
                 .where(*filters)
-                .order_by(SourceListRecord.id.desc())
+                .order_by(order_expr, SourceListRecord.id.desc())
                 .offset(offset)
                 .limit(limit)
             )
@@ -189,7 +231,7 @@ def list_sources(
             .all()
         )
         items = [SourceListRecordOut.model_validate(row) for row in rows]
-    return SourceListPage(items=items, total=total, limit=limit, offset=offset)
+    return SourceListPage(items=items, total=total, limit=limit, offset=offset, summary=summary)
 
 
 @router.patch("/{source_id}", response_model=SourceListRecordOut)

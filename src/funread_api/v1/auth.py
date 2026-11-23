@@ -42,7 +42,9 @@ from funread_api.security import (
     CurrentUser,
     OptionalUser,
     SessionDep,
+    _bearer_token,
     auth_enabled,
+    effective_role,
     is_authenticated,
     issue_token,
     reader_is_public,
@@ -73,6 +75,7 @@ class RegisterRequest(BaseModel):
 
 
 class SessionState(BaseModel):
+    oidc_enabled: bool = False
     #: Whether the *admin console* needs a password at all.
     auth_required: bool
     #: Whether this request holds a valid admin session.
@@ -92,8 +95,10 @@ class SessionState(BaseModel):
 
 
 def _state(request: Request, user: CurrentUser | None) -> SessionState:
+    oidc_enabled = request.app.state.oidc_config is not None
     return SessionState(
-        auth_required=auth_enabled(),
+        oidc_enabled=oidc_enabled,
+        auth_required=oidc_enabled or auth_enabled(),
         #  「当前这个身份是不是管理员」，前端据此决定放不放行 /admin。
         #
         #  以前这里是 `is_authenticated(request)`，也就是「那个预共享口令验过了吗」
@@ -102,7 +107,7 @@ def _state(request: Request, user: CurrentUser | None) -> SessionState:
         #  前端看到的和后端实际执行的不会再分叉。
         admin=bool(user and user.is_admin),
         reader_public=reader_is_public(),
-        register_open=registration_open(),
+        register_open=not oidc_enabled and registration_open(),
         authenticated=user is not None,
         user_id=user.user_id if user else None,
         username=user.username if user else None,
@@ -143,6 +148,8 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
     a code can be unusable (unknown / revoked / expired / exhausted) share one
     message -- splitting them turns this into a "does this code exist" probe.
     """
+    if request.app.state.oidc_config is not None:
+        raise HTTPException(404, "请使用单点登录")
     try:
         username = validate_credentials(payload.username, payload.password)
     except ValueError as error:
@@ -194,6 +201,8 @@ async def register(payload: RegisterRequest, request: Request, session: SessionD
 @router.post("/login", response_model=SessionState)
 async def login(payload: LoginRequest, request: Request, session: SessionDep) -> SessionState:
     """Log in as a reader. One 401 for every failure -- see funauth's ``authenticate``."""
+    if request.app.state.oidc_config is not None:
+        raise HTTPException(404, "请使用单点登录")
     existing = await accounts.get_by_username(session, (payload.username or "").strip())
     if (
         existing is not None
@@ -223,6 +232,8 @@ async def admin_login(
     payload: AdminLoginRequest, request: Request, response: Response, user: OptionalUser
 ) -> SessionState:
     """Unlock the collection console. Shared password, not an account."""
+    if request.app.state.oidc_config is not None:
+        raise HTTPException(404, "请使用单点登录")
     password = resolve_api_password()
     if password is None:
         # Nothing to log into. Say so rather than handing out a cookie that no
@@ -272,14 +283,14 @@ class AccountSummary(BaseModel):
 
 
 @router.get("/accounts", response_model=AccountSummary)
-async def account_summary(session: SessionDep) -> AccountSummary:
+async def account_summary(request: Request, session: SessionDep) -> AccountSummary:
     """First-run probe. Deliberately exposes only a count, never a user list."""
     users = await count_users(session)
     return AccountSummary(
         users=users,
-        register_open=registration_open(),
+        register_open=request.app.state.oidc_config is None and registration_open(),
         min_password_length=MIN_PASSWORD_LENGTH,
-        bootstrap=users == 0,
+        bootstrap=users == 0 and request.app.state.oidc_config is None,
     )
 
 
@@ -312,7 +323,7 @@ class UserPatch(BaseModel):
 
 @router.get("/users", response_model=list[UserOut])
 async def list_accounts(
-    session: SessionDep, actor: CurrentUser = Depends(require_reader_admin)
+    request: Request, session: SessionDep, actor: CurrentUser = Depends(require_reader_admin)
 ) -> list[UserOut]:
     """列出所有账号。"""
     users = await accounts.list_users(session)
@@ -320,7 +331,7 @@ async def list_accounts(
         UserOut(
             user_id=int(item.id),
             username=item.username,
-            role=item.role,
+            role=effective_role(request, item),
             is_active=bool(item.is_active),
             is_self=int(item.id) == actor.user_id,
         )
@@ -332,6 +343,7 @@ async def list_accounts(
 async def update_account(
     user_id: int,
     payload: UserPatch,
+    request: Request,
     session: SessionDep,
     actor: CurrentUser = Depends(require_reader_admin),
 ) -> UserOut:
@@ -349,6 +361,8 @@ async def update_account(
     走服务层而不是直接改 ORM 属性：后者绕过 funauth，以后它在角色变更上加审计或
     缓存失效，这里就挂不上。
     """
+    if request.app.state.oidc_config is not None and payload.role is not None:
+        raise HTTPException(400, "单点登录模式下管理员身份由 Casdoor sub 决定")
     user = await accounts.get_by_id(session, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
@@ -377,7 +391,7 @@ async def update_account(
     return UserOut(
         user_id=int(user.id),
         username=user.username,
-        role=user.role,
+        role=effective_role(request, user),
         is_active=bool(user.is_active),
         is_self=False,
     )
@@ -404,6 +418,10 @@ class DeviceTokenOut(BaseModel):
 class DeviceTokenCreated(DeviceTokenOut):
     #: 明文 token，**只在这里出现这一次**。库里只存 sha256，丢了只能重新签发。
     token: str
+
+
+class CurrentDeviceTokenOut(DeviceTokenOut):
+    username: str
 
 
 class DeviceTokenIn(BaseModel):
@@ -445,13 +463,31 @@ async def create_device_token(
     return DeviceTokenCreated(**_token_out(row).model_dump(), token=raw)
 
 
+@router.get("/tokens/current", response_model=CurrentDeviceTokenOut)
+async def current_device_token(
+    request: Request, session: SessionDep, user: CurrentUser = Depends(require_user)
+) -> CurrentDeviceTokenOut:
+    raw = _bearer_token(request)
+    if not raw:
+        raise HTTPException(status_code=401, detail="需要设备凭据")
+    row = await session.scalar(
+        sa.select(ReaderDeviceToken).where(
+            ReaderDeviceToken.token_hash == hash_device_token(raw),
+            ReaderDeviceToken.user_id == user.user_id,
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=401, detail="设备凭据无效")
+    return CurrentDeviceTokenOut(**_token_out(row).model_dump(), username=user.username)
+
+
 @router.post(
     "/tokens/issue",
     response_model=DeviceTokenCreated,
     status_code=status.HTTP_201_CREATED,
 )
 async def issue_device_token(
-    payload: DeviceTokenIssueIn, session: SessionDep
+    payload: DeviceTokenIssueIn, request: Request, session: SessionDep
 ) -> DeviceTokenCreated:
     """用账号口令直接换一个设备 token，**不需要先建立会话**。
 
@@ -470,6 +506,8 @@ async def issue_device_token(
     **不处理 scrypt 老账号**：那条升级路径在 `/auth/login` 里，走一次浏览器登录
     就换成 bcrypt 了。在这里再抄一遍逻辑，等于把同一件事的两个实现放在两处。
     """
+    if request.app.state.oidc_config is not None:
+        raise HTTPException(404, "请使用单点登录")
     try:
         user = await accounts.authenticate(
             session, (payload.username or "").strip(), payload.password

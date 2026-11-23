@@ -235,7 +235,7 @@ def engine_errors() -> Iterator[None]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (JsNotSupportedError, UnsupportedFeatureError, WebViewNotSupportedError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"此源暂不支持：{exc}",
         ) from exc
     except Exception as exc:

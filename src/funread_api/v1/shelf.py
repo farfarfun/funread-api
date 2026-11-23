@@ -295,7 +295,7 @@ def check_updates(
         total = len(set(payload.book_keys))
     if not total:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有要检查的书"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="没有要检查的书"
         )
 
     tracker = get_update_check_tracker()
@@ -429,11 +429,11 @@ def download(
     _require_shelf_book(book_key, user)
     if not payload.chapters:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="没有要下载的章节"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="没有要下载的章节"
         )
     if len(payload.chapters) > MAX_DOWNLOAD_CHAPTERS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"一次最多下载 {MAX_DOWNLOAD_CHAPTERS} 章",
         )
 

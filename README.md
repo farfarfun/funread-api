@@ -41,6 +41,38 @@ Runtime actions invoke only the installed `funread-api` CLI. The same CLI also p
 `upgrade [version]`, `rollback <version>`, and `uninstall`; the last action stops the
 managed service before removing the package.
 
+## Casdoor 单点登录
+
+在 Casdoor 为 Funread 创建独立的 Application，**Redirect URLs** 精确填写
+`https://read.farfarfun.com/api/v1/auth/oidc/callback`。确认
+`https://id.farfarfun.com/.well-known/openid-configuration` 返回的 `issuer`，
+并记录 Application 的 Client ID、Client Secret 和统一管理员 ID Token 的 `sub`。
+不要把用户名、邮箱或显示名填进 `admin_subject`。
+
+在运行 API 的账号下编辑 `~/.farfarfun/funread/api/config.toml`：
+
+```toml
+[oidc]
+issuer = "https://id.farfarfun.com"
+client_id = "Funread Application 的 Client ID"
+client_secret = "Funread Application 的 Client Secret"
+redirect_uri = "https://read.farfarfun.com/api/v1/auth/oidc/callback"
+admin_subject = "统一管理员 ID Token 的 sub"
+timeout_seconds = 120
+```
+
+将域名和凭据替换为实际值，配置文件权限设为 `0600`，并通过 HTTPS 访问 Funread。
+启动时 API 自动给已有的 `reader_user` 表补充 OIDC 身份列和唯一索引；数据库应先备份。
+首次登录按 `(issuer, sub)` 新建独立的本地读者记录，书架、进度和订阅继续以本地
+`user_id` 关联，不会按同名或邮箱合并旧账号。仅配置的管理员 `sub` 能访问管理端；
+停用账号会使会话和设备凭据失效。
+
+配置 OIDC 后，本地密码登录、注册、共享管理口令登录和密码换设备凭据入口关闭；
+浏览器与 light 客户端从 `/web/login` 跳转 Casdoor。打包客户端在浏览器登录后，
+到「我的设备」创建一次性显示的设备凭据，再在客户端的「连接服务器」页选择
+「统一账号」并录入。设备凭据可在「我的设备」单独吊销。未配置 `[oidc]` 时原有
+本地登录保持可用。
+
 ## Development
 
 ```bash

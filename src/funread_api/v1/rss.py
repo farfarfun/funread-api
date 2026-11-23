@@ -208,12 +208,12 @@ def _parse_variables(raw: str) -> dict[str, str]:
         decoded = json.loads(raw)
     except ValueError as error:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"variables 不是合法的 JSON：{error}",
         ) from error
     if not isinstance(decoded, dict):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="variables 必须是一个 JSON 对象",
         )
     return {str(key): str(value) for key, value in decoded.items()}
@@ -280,7 +280,7 @@ def subscribe(
     if payload.kind == KIND_LEGADO:
         if payload.url_id is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="kind=legado 需要 url_id",
             )
         with engine_errors():
@@ -288,7 +288,7 @@ def subscribe(
     else:
         if not payload.feed_url.strip():
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="kind=feed 需要 feed_url",
             )
         #  A bad feed URL is the caller's typo, not a server fault, so the
