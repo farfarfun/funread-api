@@ -148,7 +148,12 @@ def test_replace_rules_crud_test_and_batch_chapters_purify(monkeypatch):
         database_url = None
 
         def content(
-            self, url_id: int, chapter: Chapter, info: BookInfo | None = None, book_key: str = ""
+            self,
+            url_id: int,
+            chapter: Chapter,
+            info: BookInfo | None = None,
+            book_key: str = "",
+            next_chapter_url: str = "",
         ) -> ChapterContent:
             if chapter.index == 1:
                 raise RuntimeError("源站超时")

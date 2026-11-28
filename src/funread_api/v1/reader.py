@@ -152,6 +152,7 @@ class ChapterModel(BaseModel):
     update_time: str = ""
     is_vip: bool = False
     is_pay: bool = False
+    is_volume: bool = False
     variables: dict[str, str] = Field(default_factory=dict)
 
     @classmethod
@@ -159,7 +160,10 @@ class ChapterModel(BaseModel):
         return cls(**asdict(chapter))
 
     def to_chapter(self) -> Chapter:
-        return Chapter(**self.model_dump())
+        data = self.model_dump()
+        if "is_volume" not in Chapter.__dataclass_fields__:
+            data.pop("is_volume", None)
+        return Chapter(**data)
 
 
 class TocRequest(BaseModel):
@@ -178,6 +182,8 @@ class ContentRequest(BaseModel):
     book: BookInfoModel | None = None
     #: When given, the chapter is served from (and written to) the offline cache.
     book_key: str = ""
+    #: Optional URL of the next chapter so `nextContentUrl` pagination stops at the chapter boundary.
+    next_chapter_url: str = ""
     #: Whether to apply the current user's enabled replace purification rules.
     apply_replace: bool = True
 
@@ -308,12 +314,17 @@ def toc(payload: TocRequest) -> TocOut:
 @router.post("/content", response_model=ContentOut)
 def content(payload: ContentRequest, user: OptionalUser = None) -> ContentOut:
     service = get_reader_service()
+    kwargs: dict[str, object] = {
+        "info": payload.book.to_info() if payload.book else None,
+        "book_key": payload.book_key,
+    }
+    if payload.next_chapter_url:
+        kwargs["next_chapter_url"] = payload.next_chapter_url
     with engine_errors():
         result = service.content(
             payload.url_id,
             payload.chapter.to_chapter(),
-            info=payload.book.to_info() if payload.book else None,
-            book_key=payload.book_key,
+            **kwargs,  # type: ignore[arg-type]
         )
     title = result.title or payload.chapter.name
     text = result.text
@@ -355,13 +366,19 @@ def batch_chapters(
     items: list[BatchChapterItem] = []
     ok_count = 0
     failed_count = 0
-    for chapter in payload.chapters:
+    for pos, chapter in enumerate(payload.chapters):
+        next_url = payload.chapters[pos + 1].url if pos + 1 < len(payload.chapters) else ""
         try:
+            call_kwargs: dict[str, object] = {
+                "info": book_info_obj,
+                "book_key": payload.book_key,
+            }
+            if next_url:
+                call_kwargs["next_chapter_url"] = next_url
             result = service.content(
                 payload.url_id,
                 chapter.to_chapter(),
-                info=book_info_obj,
-                book_key=payload.book_key,
+                **call_kwargs,  # type: ignore[arg-type]
             )
             title = result.title or chapter.name
             text = result.text
