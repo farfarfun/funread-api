@@ -748,3 +748,193 @@ def reset_scores(
         source_type=source_type, url_id=url_id, database_url=_database_url(source_type)
     )
     return {"reset": affected}
+
+
+class PoolImportIn(BaseModel):
+    source_type: str = Field(default="book", pattern="^(book|rss)$")
+    sources: list[dict[str, Any]] = Field(min_length=1, max_length=2000)
+
+
+class PoolImportOut(BaseModel):
+    imported: int
+    scanned: int
+    enabled: int
+
+
+class PoolDebugIn(BaseModel):
+    url_id: int = Field(ge=1)
+    keyword: str = Field(min_length=1, max_length=64)
+
+
+class PoolDebugStep(BaseModel):
+    stage: str
+    ok: bool
+    elapsed_ms: int
+    summary: str = ""
+    error: str = ""
+
+
+class PoolDebugOut(BaseModel):
+    url_id: int
+    keyword: str
+    ok: bool
+    steps: list[PoolDebugStep]
+
+
+@router.post("/import", response_model=PoolImportOut, status_code=status.HTTP_201_CREATED)
+def import_pool_sources(
+    payload: PoolImportIn,
+    actor: CurrentUser = Depends(require_reader_admin),
+) -> PoolImportOut:
+    """Import raw Legado book/rss source JSON dicts directly into the server source registry."""
+    _ = actor
+    service = get_reader_service() if payload.source_type == "book" else get_rss_service()
+    service.registry.ingest(payload.sources)
+    report = service.registry.scan()
+    return PoolImportOut(
+        imported=len(payload.sources),
+        scanned=int(report.get("scanned", 0)),
+        enabled=int(report.get("enabled", 0)),
+    )
+
+
+@router.post("/debug", response_model=PoolDebugOut)
+def debug_pool_source(
+    payload: PoolDebugIn,
+    actor: CurrentUser = Depends(require_reader_admin),
+) -> PoolDebugOut:
+    """Run a single-source search -> book_info -> toc -> chapter content trace for BookSourceDebugScreen."""
+    _ = actor
+    service = get_reader_service()
+    steps: list[PoolDebugStep] = []
+
+    t0 = time.monotonic()
+    try:
+        search_hits = service.search_one(payload.url_id, payload.keyword)
+    except Exception as exc:  # noqa: BLE001
+        steps.append(
+            PoolDebugStep(
+                stage="search",
+                ok=False,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                error=str(exc),
+            )
+        )
+        return PoolDebugOut(url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps)
+
+    if not search_hits:
+        steps.append(
+            PoolDebugStep(
+                stage="search",
+                ok=False,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                summary="0 条结果",
+                error="搜索返回空列表",
+            )
+        )
+        return PoolDebugOut(url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps)
+
+    first = search_hits[0]
+    first_name = getattr(first, "name", "") or (first.get("name", "") if isinstance(first, dict) else "")
+    first_author = getattr(first, "author", "") or (
+        first.get("author", "") if isinstance(first, dict) else ""
+    )
+    first_url = getattr(first, "book_url", "") or (
+        first.get("book_url", "") if isinstance(first, dict) else ""
+    )
+    steps.append(
+        PoolDebugStep(
+            stage="search",
+            ok=True,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            summary=f"命中 {len(search_hits)} 本，首条：{first_name}（{first_author}）",
+        )
+    )
+
+    t1 = time.monotonic()
+    try:
+        info = service.book_info(payload.url_id, first_url, name=first_name, author=first_author)
+        steps.append(
+            PoolDebugStep(
+                stage="book_info",
+                ok=True,
+                elapsed_ms=int((time.monotonic() - t1) * 1000),
+                summary=f"书名：{info.name}，目录：{info.toc_url or info.book_url}",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        steps.append(
+            PoolDebugStep(
+                stage="book_info",
+                ok=False,
+                elapsed_ms=int((time.monotonic() - t1) * 1000),
+                error=str(exc),
+            )
+        )
+        return PoolDebugOut(url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps)
+
+    t2 = time.monotonic()
+    try:
+        chapters = service.toc(payload.url_id, info)
+        if not chapters:
+            steps.append(
+                PoolDebugStep(
+                    stage="toc",
+                    ok=False,
+                    elapsed_ms=int((time.monotonic() - t2) * 1000),
+                    summary="0 章",
+                    error="目录解析为空",
+                )
+            )
+            return PoolDebugOut(
+                url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps
+            )
+        steps.append(
+            PoolDebugStep(
+                stage="toc",
+                ok=True,
+                elapsed_ms=int((time.monotonic() - t2) * 1000),
+                summary=f"共 {len(chapters)} 章，首章：{chapters[0].name}",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        steps.append(
+            PoolDebugStep(
+                stage="toc",
+                ok=False,
+                elapsed_ms=int((time.monotonic() - t2) * 1000),
+                error=str(exc),
+            )
+        )
+        return PoolDebugOut(url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps)
+
+    t3 = time.monotonic()
+    try:
+        chapter_res = service.content(payload.url_id, chapters[0], info=info)
+        preview = (chapter_res.text or "").strip().replace("\n", " ")[:120]
+        steps.append(
+            PoolDebugStep(
+                stage="content",
+                ok=bool(preview),
+                elapsed_ms=int((time.monotonic() - t3) * 1000),
+                summary=f"正文 {len(chapter_res.text)} 字：{preview}",
+                error="" if preview else "正文解析为空",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        steps.append(
+            PoolDebugStep(
+                stage="content",
+                ok=False,
+                elapsed_ms=int((time.monotonic() - t3) * 1000),
+                error=str(exc),
+            )
+        )
+        return PoolDebugOut(url_id=payload.url_id, keyword=payload.keyword, ok=False, steps=steps)
+
+    return PoolDebugOut(
+        url_id=payload.url_id,
+        keyword=payload.keyword,
+        ok=all(step.ok for step in steps),
+        steps=steps,
+    )

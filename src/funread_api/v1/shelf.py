@@ -11,6 +11,12 @@ from funread.legado.reader import (
     list_cached_chapter_indexes,
 )
 from funread_api.security import CurrentUser, require_user
+from funread_api.user_data import (
+    ShelfBookMeta,
+    delete_shelf_meta,
+    get_shelf_meta_map,
+    upsert_shelf_meta,
+)
 
 from .deps import (
     TaskTracker,
@@ -85,6 +91,27 @@ class ShelfBookOut(BaseModel):
     last_checked_at: str = ""
     #: 上次检查失败的原因。成功一次就清掉。
     last_check_error: str = ""
+    #: 置顶标记（由 client_shelf_meta 扩展存储）。
+    pinned: bool = False
+    #: 书架排序权重，数值越大越靠前。
+    sort_order: int = 0
+    #: 是否参与自动检查更新。
+    can_update: bool = True
+
+
+class ShelfPatchIn(BaseModel):
+    pinned: bool | None = None
+    sort_order: int | None = None
+    can_update: bool | None = None
+    name: str | None = Field(default=None, max_length=255)
+    author: str | None = Field(default=None, max_length=255)
+    cover_url: str | None = Field(default=None, max_length=1024)
+    intro: str | None = None
+    group: str | None = Field(default=None, max_length=MAX_GROUP_LENGTH)
+
+
+class BatchDeleteIn(BaseModel):
+    book_keys: list[str] = Field(min_length=1, max_length=MAX_CHECK_BOOKS)
 
 
 class BookKeyOut(BaseModel):
@@ -206,6 +233,23 @@ def _require_shelf_book(book_key: str, user: CurrentUser) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="书架里没有这本书")
 
 
+def _merge_meta(item: dict, meta: ShelfBookMeta | None) -> ShelfBookOut:
+    merged = dict(item)
+    if meta is not None:
+        merged["pinned"] = bool(meta.pinned)
+        merged["sort_order"] = int(meta.sort_order)
+        merged["can_update"] = bool(meta.can_update)
+        if meta.custom_name:
+            merged["name"] = meta.custom_name
+        if meta.custom_author:
+            merged["author"] = meta.custom_author
+        if meta.custom_cover_url:
+            merged["cover_url"] = meta.custom_cover_url
+        if meta.custom_intro:
+            merged["intro"] = meta.custom_intro
+    return ShelfBookOut(**merged)
+
+
 @router.get("", response_model=list[ShelfBookOut])
 def list_books(
     group: str | None = Query(
@@ -215,10 +259,12 @@ def list_books(
     ),
     user: CurrentUser = Depends(require_user),
 ) -> list[ShelfBookOut]:
-    return [
-        ShelfBookOut(**item)
-        for item in get_reader_service().shelf(user_id=user.user_id, group=group)
-    ]
+    service = get_reader_service()
+    raw_items = service.shelf(user_id=user.user_id, group=group)
+    meta_map = get_shelf_meta_map(user.user_id, database_url=service.database_url)
+    books = [_merge_meta(item, meta_map.get(item["book_key"])) for item in raw_items]
+    books.sort(key=lambda b: (b.pinned, b.sort_order), reverse=True)
+    return books
 
 
 @router.post("", response_model=BookKeyOut, status_code=status.HTTP_201_CREATED)
@@ -353,10 +399,55 @@ def check_updates_progress(
     )
 
 
+@router.post("/batch-delete", response_model=AffectedOut)
+def batch_delete_books(
+    payload: BatchDeleteIn,
+    user: CurrentUser = Depends(require_user),
+) -> AffectedOut:
+    service = get_reader_service()
+    removed = 0
+    for key in payload.book_keys:
+        if service.remove_from_shelf(key, user_id=user.user_id):
+            removed += 1
+    delete_shelf_meta(user.user_id, payload.book_keys, database_url=service.database_url)
+    return AffectedOut(affected=removed)
+
+
+@router.patch("/{book_key}", response_model=ShelfBookOut)
+def patch_book(
+    book_key: str,
+    payload: ShelfPatchIn,
+    user: CurrentUser = Depends(require_user),
+) -> ShelfBookOut:
+    _require_shelf_book(book_key, user)
+    service = get_reader_service()
+    if payload.group is not None:
+        service.set_shelf_group([book_key], payload.group, user_id=user.user_id)
+    meta = upsert_shelf_meta(
+        user.user_id,
+        book_key,
+        pinned=payload.pinned,
+        sort_order=payload.sort_order,
+        can_update=payload.can_update,
+        custom_name=payload.name,
+        custom_author=payload.author,
+        custom_cover_url=payload.cover_url,
+        custom_intro=payload.intro,
+        database_url=service.database_url,
+    )
+    items = service.shelf(user_id=user.user_id, group=None)
+    for item in items:
+        if item["book_key"] == book_key:
+            return _merge_meta(item, meta)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="书架里没有这本书")
+
+
 @router.delete("/{book_key}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def remove_book(book_key: str, user: CurrentUser = Depends(require_user)) -> None:
-    if not get_reader_service().remove_from_shelf(book_key, user_id=user.user_id):
+    service = get_reader_service()
+    if not service.remove_from_shelf(book_key, user_id=user.user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="书架里没有这本书")
+    delete_shelf_meta(user.user_id, [book_key], database_url=service.database_url)
 
 
 @router.put("/{book_key}/progress", status_code=status.HTTP_204_NO_CONTENT, response_model=None)

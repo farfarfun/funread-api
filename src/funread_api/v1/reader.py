@@ -19,7 +19,8 @@ from funread.legado.manage.source.storage import (
     upsert_source_list_record,
 )
 from funread.legado.reader import DEFAULT_SEARCH_SOURCES
-from funread_api.security import CurrentUser, require_user
+from funread_api.security import CurrentUser, OptionalUser, require_user
+from funread_api.user_data import apply_replace_rules, list_enabled_replace_rules
 
 from .deps import engine_errors, get_reader_service, get_rss_service
 
@@ -177,6 +178,8 @@ class ContentRequest(BaseModel):
     book: BookInfoModel | None = None
     #: When given, the chapter is served from (and written to) the offline cache.
     book_key: str = ""
+    #: Whether to apply the current user's enabled replace purification rules.
+    apply_replace: bool = True
 
 
 class ContentOut(BaseModel):
@@ -184,6 +187,31 @@ class ContentOut(BaseModel):
     text: str
     url: str
     next_url: str
+    applied_rule_ids: list[int] = Field(default_factory=list)
+
+
+class BatchChaptersRequest(BaseModel):
+    url_id: int
+    book_key: str = ""
+    chapters: list[ChapterModel] = Field(min_length=1, max_length=50)
+    book: BookInfoModel | None = None
+    apply_replace: bool = True
+
+
+class BatchChapterItem(BaseModel):
+    index: int
+    name: str
+    url: str
+    title: str = ""
+    text: str = ""
+    error: str = ""
+    applied_rule_ids: list[int] = Field(default_factory=list)
+
+
+class BatchChaptersOut(BaseModel):
+    items: list[BatchChapterItem]
+    ok: int
+    failed: int
 
 
 class ExploreSourceOut(BaseModel):
@@ -278,22 +306,96 @@ def toc(payload: TocRequest) -> TocOut:
 
 
 @router.post("/content", response_model=ContentOut)
-def content(payload: ContentRequest) -> ContentOut:
+def content(payload: ContentRequest, user: OptionalUser = None) -> ContentOut:
+    service = get_reader_service()
     with engine_errors():
-        result = get_reader_service().content(
+        result = service.content(
             payload.url_id,
             payload.chapter.to_chapter(),
             info=payload.book.to_info() if payload.book else None,
             book_key=payload.book_key,
         )
-    #  `pages` is left out on purpose: it is the un-merged per-page source text,
-    #  a debugging aid that would roughly double the payload on every chapter.
+    title = result.title or payload.chapter.name
+    text = result.text
+    applied_ids: list[int] = []
+    if payload.apply_replace and user is not None:
+        rules = list_enabled_replace_rules(user.user_id, database_url=service.database_url)
+        if rules:
+            book_name = payload.book.name if payload.book else ""
+            title, title_ids = apply_replace_rules(
+                title, rules, book_name=book_name, book_key=payload.book_key, is_title=True
+            )
+            text, text_ids = apply_replace_rules(
+                text, rules, book_name=book_name, book_key=payload.book_key, is_title=False
+            )
+            applied_ids = list(dict.fromkeys([*title_ids, *text_ids]))
     return ContentOut(
-        title=result.title or payload.chapter.name,
-        text=result.text,
+        title=title,
+        text=text,
         url=result.url,
         next_url=result.next_url,
+        applied_rule_ids=applied_ids,
     )
+
+
+@router.post("/chapters/batch", response_model=BatchChaptersOut)
+def batch_chapters(
+    payload: BatchChaptersRequest,
+    user: OptionalUser = None,
+) -> BatchChaptersOut:
+    """Fetch a slice of chapters (hitting server cache when present) for client local offline storage."""
+    service = get_reader_service()
+    book_info_obj = payload.book.to_info() if payload.book else None
+    book_name = payload.book.name if payload.book else ""
+    rules = (
+        list_enabled_replace_rules(user.user_id, database_url=service.database_url)
+        if payload.apply_replace and user is not None
+        else []
+    )
+    items: list[BatchChapterItem] = []
+    ok_count = 0
+    failed_count = 0
+    for chapter in payload.chapters:
+        try:
+            result = service.content(
+                payload.url_id,
+                chapter.to_chapter(),
+                info=book_info_obj,
+                book_key=payload.book_key,
+            )
+            title = result.title or chapter.name
+            text = result.text
+            applied_ids: list[int] = []
+            if rules:
+                title, title_ids = apply_replace_rules(
+                    title, rules, book_name=book_name, book_key=payload.book_key, is_title=True
+                )
+                text, text_ids = apply_replace_rules(
+                    text, rules, book_name=book_name, book_key=payload.book_key, is_title=False
+                )
+                applied_ids = list(dict.fromkeys([*title_ids, *text_ids]))
+            items.append(
+                BatchChapterItem(
+                    index=chapter.index,
+                    name=chapter.name,
+                    url=chapter.url,
+                    title=title,
+                    text=text,
+                    applied_rule_ids=applied_ids,
+                )
+            )
+            ok_count += 1
+        except Exception as exc:  # noqa: BLE001 — 单章失败不应中断整批缓存
+            items.append(
+                BatchChapterItem(
+                    index=chapter.index,
+                    name=chapter.name,
+                    url=chapter.url,
+                    error=str(exc),
+                )
+            )
+            failed_count += 1
+    return BatchChaptersOut(items=items, ok=ok_count, failed=failed_count)
 
 
 @router.get("/sources", response_model=SwitchSourcePage)

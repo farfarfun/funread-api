@@ -5,6 +5,7 @@ import pytest
 from funread.base import config
 from funread.legado.reader import storage
 from funread_api import accounts as accounts_module
+from funread_api.user_data import reset_client_data_init_cache
 from funread_api.v1.deps import (
     get_download_tracker,
     get_update_check_tracker,
@@ -86,6 +87,7 @@ def _isolate_database(tmp_path, monkeypatch):
         cache_root=str(tmp_path / "hubs"),
     )
     monkeypatch.setattr(storage, "_INITIALIZED_DATABASES", set())
+    reset_client_data_init_cache()
     reset_reader_services()
     get_download_tracker().clear()
     get_update_check_tracker().clear()

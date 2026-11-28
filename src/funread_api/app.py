@@ -14,6 +14,7 @@ from funread.legado.manage.source.storage import init_source_db
 from funread.legado.reader import init_reader_db
 from funread_api.accounts import init_auth_db, resolve_session_secret
 from funread_api.security import SESSION_TTL, auth_enabled, resolve_cors_origins
+from funread_api.user_data import init_client_data_db
 from funread_api.v1 import api_router, sso
 
 logger = logging.getLogger("funread_api")
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # surface immediately instead of on the first request.
     init_source_db()
     init_reader_db()
+    init_client_data_db()
     init_auth_db()
     if app.state.oidc_config is None and not auth_enabled():
         logger.warning(

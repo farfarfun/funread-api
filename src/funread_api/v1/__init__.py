@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 from funread_api.security import require_reader, require_reader_admin, require_user
 
 from .auth import router as auth_router
+from .client_features import router as client_features_router
 from .pool import router as pool_router
 from .reader import router as reader_router
 from .rss import router as rss_router
@@ -47,5 +48,6 @@ api_router.include_router(shelf_router, dependencies=[Depends(require_user)])
 #  fetch a URL the caller supplies (SSRF). Same guard as /shelf: authenticated
 #  reader only, never opened by [auth] reader_public.
 api_router.include_router(rss_router, dependencies=[Depends(require_user)])
+api_router.include_router(client_features_router, dependencies=[Depends(require_user)])
 
 __all__ = ["api_router"]
