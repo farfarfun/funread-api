@@ -33,9 +33,9 @@ DEFAULT_SOURCE_LISTS = {
         "https://legado.aoaostar.com/sources/e3e5d620.json",
     ),
     "rss": (
-        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1000.json",
-        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1001.json",
-        "https://farfarfun.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1002.json",
+        "https://farfarfun-read.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1000.json",
+        "https://farfarfun-read.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1001.json",
+        "https://farfarfun-read.github.io/funread-cache/funread/legado/snapshot/lasted/rss/progress-1002.json",
     ),
 }
 
